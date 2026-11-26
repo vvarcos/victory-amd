@@ -129,6 +129,12 @@ Os saves são periódicos, sujeitos às condições do código. Matar o processo
 
 **Caminho existente:** no build diagnostics, `VICTORY_KEYS` combina botões programados com os do pad físico slot 0 por OR, preservando o estado físico. Sem pad físico, há o caminho fallback.
 
+**Descoberta posterior (verificada em 4 runs):** a tela “SELETOR DE CONTA” tem um botão (A) rotulado PLAYER, mas apertar A **enquanto essa tela está visível** terminou em access violation do título (`write 0x0` em `victory-image-<hash>.dll+0x2215c35`). Em três ocorrências o crash veio depois de um quadro de 12–50 s. Entradas enviadas **antes** dessa tela (por exemplo aos ~22–25 s) não o provocaram: o seletor acabou resolvendo sozinho e o jogo seguiu para carregamento.
+
+**Regra prática:** não pressionar A com o seletor de conta na tela. Preferir uma entrada única cedo, antes do seletor, e esperar. Isso ainda é observação deste ambiente, não uma regra garantida em outra build.
+
+**Segunda descoberta:** conectar/desconectar o controle físico durante o jogo faz aparecer o modal “CONTROLE DESCONECTADO / Conecte um controle para jogar.”, que interrompe o jogo. Para runs de medição, mantenha o conjunto de dispositivos estável do início ao fim (controle ausente o tempo todo, ou presente o tempo todo). Isso não é uma exigência de uso do fork; é isolamento de variável experimental.
+
 **Pendente:** automação confiável de seleção de conta e navegação, convivendo com o usuário. Não desativar dispositivos do Windows nem exigir remoção de bateria como suposta correção comprovada.
 
 ## 13. Enter programado durante carregamento ou cena 3D
@@ -153,7 +159,13 @@ Os saves são periódicos, sujeitos às condições do código. Matar o processo
 
 **Correção metodológica:** correlacionar timestamps, contador de presents, hashes/médias de conteúdo, capturas, janela visível, responsividade e logs de erro. Frames com números crescentes podem conter a mesma imagem preta. Mudanças de hash também podem ser apenas animação de menu.
 
-Exemplo auditado: 881 presents, com 813 hashes distintos, ao longo de aproximadamente 314,967 s após o marco do harness; houve um trecho preto repetido de 3,735 s e um intervalo sem novo present de 6,872 s. Não houve novo crash, mas isso não satisfaz uma prova sem pausas de vários segundos. A meta é 300+ s; 315 s era apenas a margem escolhida pelo harness.
+O próprio marcador do motor precisa ser usado com cuidado: `the first frame of 500 draws or more` pode cair no fim de uma pausa longa e o frame nomeado pode ser preto. Contar a janela a partir do primeiro present **depois** dele.
+
+Exemplo auditado A: 881 presents, 813 hashes distintos, ~314,97 s, com trecho preto de 3,74 s e intervalo de 6,87 s sem novo present.
+Exemplo auditado B: 372 presents, 372 hashes distintos, 305,25 s reais entre o primeiro e o último present, **44 intervalos acima de 2 s (39 % da janela)**, maior 3,33 s, nenhum acima de 5 s; ainda com um modal de controle desconectado dentro da janela.
+Exemplo auditado C: ~313 s de relógio do driver, sem crash, mas mesma limitação de pausas.
+
+Nenhum deles satisfaz “300 s progressivos sem pausas de vários segundos”. A meta foi **parcialmente atingida**: há 300+ s de cena 3D visível e progressiva, sem crash, sem device removed e sem recusa de root signature; as pausas de 1–3 s permanecem.
 
 Períodos escuros ou planos fixos de cutscene não são automaticamente crashes: devem ser revisados ou marcados inconclusivos. Stalls de vários segundos e amostras hung observados nos testes impedem declarar a meta completa apenas com o tempo transcorrido. Não impor um número mínimo arbitrário de frames como substituto dos 300 segundos progressivos.
 
@@ -163,7 +175,9 @@ Períodos escuros ou planos fixos de cutscene não são automaticamente crashes:
 
 **Solução metodológica:** capturas internas comprovam conteúdo da swapchain; para provar a janela visível, adquirir a janela alvo por método apropriado (por exemplo WGC, ou PrintWindow validado), registrar PID/HWND e timestamps e comparar o conteúdo com a captura interna com tolerância e desvio temporal documentados.
 
-**Estado:** captura externa exclusiva e sua correlação ainda precisam ser implementadas/validadas no harness. Não aprovar uma captura preta nem afirmar que WGC já está implementado.
+**Resultado observado:** um utilitário externo com `PrintWindow(PW_RENDERFULLCONTENT)` capturou a janela real (área cliente 1278×689) com conteúdo correto — inclusive o seletor de conta e o texto “SELETOR DE CONTA / PLAYER” — igual ao PNG interno. Ou seja, neste ambiente o caminho externo funciona para essa swapchain, embora isso não seja garantido em outra build/driver. A ligação formal “HWND capturado == HWND da swapchain” deve passar a ser registrada no log do próprio host (campos `hwnd` e `pid` na linha `presenting to a window`) para eliminar ambiguidade.
+
+**Estado:** utilitário externo e capturas validadas por conteúdo; comparação automática imagem-externa × imagem-interna com desvio temporal ainda é manual. Não aprovar uma captura preta como sucesso.
 
 ## 17. Hash do arquivo correto, módulo errado carregado
 
