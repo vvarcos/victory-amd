@@ -292,7 +292,7 @@ Fonte: [pull requests de myokex/victory-amd](https://github.com/myokex/victory-a
 
 | PR | Relevância e estado local |
 |---|---|
-| [#6](https://github.com/myokex/victory-amd/pull/6) | Espera por pipeline para cada thread durante loading; candidato principal para passes descartados. Portado localmente preservando framelog; validação pendente. `VICTORY_PIPELINE_WAIT_OWN=0` permite controle A/B. |
+| [#6](https://github.com/myokex/victory-amd/pull/6) | Espera por pipeline para cada thread durante loading. Portado preservando framelog; 5 testes passaram e o teste de segunda thread foi exercitado explicitamente com 500 ms. No A/B r41, o controle `OWN=0` caiu antes do mundo no AV conhecido `victory-image…+0x23cf683`; `OWN=1` alcançou 127,7 s após o marcador sem AV/device removed/shader inválido, mas as três capturas externas ainda mostram pele/cenário sem materiais e um interior quase preto. Resultado não comparativo e insuficiente para atribuir estabilidade; demonstra que o PR sozinho não corrige o defeito visual. |
 | [#14](https://github.com/myokex/victory-amd/pull/14) | Descritor nulo correto em heap de samplers. Aplicado localmente, ainda sem validação visual isolada. |
 | [#5](https://github.com/myokex/victory-amd/pull/5) | Evita criar um PSO específico associado a crash no driver AMD; aplicado localmente, não prova correção do AV no código do título. Pode omitir draws. |
 | [#19](https://github.com/myokex/victory-amd/pull/19) | Alinhamento >64 KiB em alocações 32-bit. Aplicado e testado em r40: mundo na primeira tentativa, 50 capturas; rosa 23,04% contra 20,38% em r39, nos 22 offsets comuns. Não demonstrou melhora; candidato a retirar do baseline visual. |
@@ -303,6 +303,8 @@ Fonte: [pull requests de myokex/victory-amd](https://github.com/myokex/victory-a
 | [#22](https://github.com/myokex/victory-amd/pull/22) | Melhora diagnóstico concorrente da info queue; não corrige texturas diretamente. Ainda não aplicado. |
 
 **Limites das conclusões anteriores:** os 56% eram referências com `host=[null]`, não a interseção comprovada de nulo + fora da fila + cópia existente. A mudança em `table_entry` é uma hipótese de correção parcial, não causa raiz exclusiva comprovada. Offsets iguais após o marcador de mundo não garantem imagens da mesma cena; os percentuais acima são exploratórios. Duas quedas com `VICTORY_TABLED_TEXTURES=1` não estabelecem causalidade, pois há AV intermitente no boot também no controle. Comparações futuras devem usar capturas visualmente correspondentes, cache inicial idêntico e uma mudança por vez.
+
+**Evidência r41 do PR #6:** os inventários iniciais de cache e dados dos braços A/B eram idênticos, o SHA-256 do executável foi `0B3BC1DE…B225E`, e só `VICTORY_PIPELINE_WAIT_OWN` variou. O braço A caiu antes do mundo e o B produziu 68 capturas internas e 3 externas. O B alterou `host-pipelines.bin` de forma própria (final: 302.800 bytes, SHA-256 `CC04962B…15EDC9`); isso não pode ser comparado ao A como efeito da variável, pois A percorreu menos conteúdo. Houve uma recusa de mesh PSO com `E_INVALIDARG`, e os milhares de drops no mundo foram atribuídos pelo log aos caminhos de ray tracing deliberadamente desabilitados/left-out, não a pipelines ainda sendo compiladas. O relatório reproduzível está em `G:\victory-data\experiments\r41-pr6\analysis.json`.
 
 ## Checklist antes de publicar um resultado
 
