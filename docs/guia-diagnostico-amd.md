@@ -238,6 +238,54 @@ Captura externa da janela (`PrintWindow` com `PW_RENDERFULLCONTENT`, HWND vindo 
 
 **Limites desta receita:** a cadência medida (~2,7 fps) é a do modo diagnóstico, que faz hashing e comparação a cada present; não representa o desempenho de um build limpo. O run prova estabilidade de mundo ocioso, não interatividade nem caminho de saída limpo (o processo foi encerrado pelo driver). A entrada é agendada por tempo; o canal diagnóstico por comando existe e tem testes, mas ainda não foi validado ao vivo com segurança (ver seção 12).
 
+## 21. Superfícies pretas: descritores de textura nulos e a fila que não drena
+
+**Sintoma:** geometria, luzes, emissivos, letreiros e cabelo aparecem; pele, roupas, paredes e cenário ficam pretos, mesmo com luz forte ao lado.
+
+**Diagnóstico que separa as causas:** `VICTORY_NULL_MAGENTA=1` (feature `diagnostics`, [descriptor/host.rs:3928](<../crates/victory-gpu/src/descriptor/host.rs#L3928>)) pinta de magenta toda view nula. Superfície **magenta** = descritor ausente; superfície **preta** = descritor existe e a textura amostra zero.
+
+Medição por imagem (fração de pixels rosados, comparando os mesmos offsets de cena entre runs):
+
+| configuração | área sem textura |
+|---|---:|
+| baseline sem marcador | 0,04 % |
+| marcador magenta, sem ajustes | 31,6–33,8 % |
+| + `VICTORY_CARD_ROOM_FOR_TARGETS_MB=512` e `VICTORY_TEXTURE_ROOM_PERCENT=97` | 18,0 % |
+| + `VICTORY_LEVELS_ON_DEMAND=1` | 10,0 % |
+| + correção de código que mantém slots não feitos na fila | 20,4 % (sem os ajustes acima) |
+
+**Causa raiz (com correção aplicada):** em [draw.rs:2906](<../crates/victory-gpu/src/draw.rs#L2906>), um draw que lia uma textura por tabela marcava o slot como “em dia” e o retirava da fila **sem verificar se o host conseguiu criar a view**. Quando a criação falhava por falta de VRAM, o slot ficava nulo **para sempre** e a textura nunca mais era tentada — exatamente o padrão `host=[null]` + `queue=[not queued]` observado em 56 % das referências.
+
+A correção condiciona a saída da fila ao slot realmente feito:
+`let made = host.texture_slot_made_from(index, handle); host.texture_slot_tabled(index, made);`
+
+**Instrumentação criada nesta linha de investigação:**
+
+- `VICTORY_LIST_SLOTS=<hash do shader>` produz linhas `~slot` nos arquivos `*-ops.txt` da captura. **O hash esperado é o do shader** (o das seções `| <hash>:`), não o do cabeçalho `[vertex …, pixel …]` do draw; usar o do cabeçalho não gera nenhuma linha.
+- Só os frames de `listed()` geram `*-ops.txt` (`first+2`, `+6`, `+30`, `+80`); `VICTORY_CAPTURE_WORLD_EVERY` afeta apenas os PNGs.
+- `VICTORY_CARD_ACCOUNTING=1` imprime por slot onde está a memória e o estado da cópia host.
+- Contador de `fits()` recusado: mostrou **zero** recusas de formato, o que descarta sRGB/formato como causa dessas superfícies.
+
+**Armadilha de operação:** `VICTORY_TABLED_TEXTURES=1` (manter tudo na fila) **piorou**: duas execuções caíram com quadros de 49–60 s e access violation antes do mundo. Tirar slots da fila é necessário; o defeito era tirá-los sem terem sido feitos.
+
+**Estado:** correção medida e com efeito parcial (33,8 % → 20,4 % em A/B pareado). Ainda restam ~20 %; o próximo passo é combinar a correção com os ajustes de VRAM acima e medir de novo.
+
+## 22. Cache: o que está provado e o que falta
+
+**Provado em 7 execuções:** a biblioteca de pipelines é carregada de um run para o seguinte com o blob idêntico (`host pipeline library loaded bytes=…`, cadeia 282.068 → 284.404 → 297.544), `made=0`, `misses=0` e `started_early` alto. Rebuild do executável **não** invalida o cache (a chave usa o fingerprint do tradutor, não o hash do executável).
+
+**Gaps conhecidos (sem correção aplicada):**
+
+- `victory warm` grava apenas pipelines **compute** e não atualiza `early-pipelines.txt`.
+- Os contadores do `warm` não distinguem hit de miss (só `translate --warm` tem booleano real).
+- `translate --warm` usa bytes não aparados, gerando chaves que o run nunca lê.
+- `VICTORY_VIEW_LIMIT` / `VICTORY_HOST_WAVE` são lidos de nomes diferentes no caminho `Translate` e no `Warm`.
+- `EARLY_MAX = 8192` trunca a lista em silêncio e a ordem é perdida no round-trip por `HashSet`.
+- Falha de escrita da early list perde a alteração (sem retry).
+- Biblioteca rejeitada não é removida; recompila até um save com entradas novas.
+
+**Critério objetivo de “cache funciona”:** usar os contadores da **execução**, não a saída do `warm` — `loaded` com o mesmo tamanho do último `saved`, `made=0`, `misses=0`, `started_early>0`, nenhum `library rejected`.
+
 ## Checklist antes de publicar um resultado
 
 - [ ] Build, revisão, features, driver, hashes e ambiente registrados.
