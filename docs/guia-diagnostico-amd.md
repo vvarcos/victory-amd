@@ -206,6 +206,37 @@ Períodos escuros ou planos fixos de cutscene não são automaticamente crashes:
 - Contar a palavra `ERROR` ou `0xc00` por substring gera falsos positivos (endereços de memória também contêm esses valores). Inspecionar mensagens completas e contexto.
 - `window closed: suspending the title` significa encerramento do título; não é prova de sucesso e não deve ser confundido automaticamente com AV.
 - Para validar `vgamepad`, criar um dispositivo usando a API realmente disponível. Um erro em um atributo inexistente do módulo não prova falha de instalação. Não criar um segundo pad sem necessidade e sem avaliar a mudança de associação de conta.
+- `Set-Content -Append` não existe no Windows PowerShell 5.1: usar `Add-Content` ou `Out-File -Append`. Um erro desses no meio de um driver encerra a medição sem gravar o resultado.
+- Ao medir pausas, não confiar em amostragem de 5 s: ela é cega para stalls de 1–4 s. Medir o intervalo entre presents consecutivos no log.
+
+## 20. Receita que produziu uma janela estável de 300 s (este ambiente)
+
+Configuração exata do run com melhor resultado (duas execuções independentes, auditadas):
+
+- Binário de diagnóstico com `--features diagnostics,agility-sdk`, `D3D12\D3D12Core.dll` app-local (versão 1.620.2.0.20261106.5, SHA-256 `70A6D47D…`).
+- Cache de shaders e de pipelines com proveniência conhecida, copiado para um diretório isolado; dados do título em cópia isolada.
+- Controle físico ausente do boot até o fim (conjunto de dispositivos estável).
+- `VICTORY_KEYS='25:Enter,90:Enter'` — duas entradas, ambas antes do mundo; nenhuma depois.
+- `VICTORY_CAPTURE_WORLD=1` e `VICTORY_CAPTURE_WORLD_EVERY=32` para frames internos.
+
+Resultado medido entre presents consecutivos:
+
+| métrica | valor |
+|---|---|
+| janela de mundo | 307,062 s |
+| presents na janela | 822 (numeração contínua) |
+| hashes distintos | 822 de 822 |
+| frames pretos | 0 |
+| maior pausa | 0,927 s |
+| pausas > 2 s | 0 |
+| pausas > 5 s | 0 |
+| access violation | nenhum |
+| `crashes.log` | inalterado (1.738 B) |
+| device removed / root signature / GPU host ausente | nenhum |
+
+Captura externa da janela (`PrintWindow` com `PW_RENDERFULLCONTENT`, HWND vindo do log do host) devolveu a mesma cena 3D da captura interna, em 1832×1001, sem preto.
+
+**Limites desta receita:** a cadência medida (~2,7 fps) é a do modo diagnóstico, que faz hashing e comparação a cada present; não representa o desempenho de um build limpo. O run prova estabilidade de mundo ocioso, não interatividade nem caminho de saída limpo (o processo foi encerrado pelo driver). A entrada é agendada por tempo; o canal diagnóstico por comando existe e tem testes, mas ainda não foi validado ao vivo com segurança (ver seção 12).
 
 ## Checklist antes de publicar um resultado
 
