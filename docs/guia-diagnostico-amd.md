@@ -242,7 +242,7 @@ Captura externa da janela (`PrintWindow` com `PW_RENDERFULLCONTENT`, HWND vindo 
 
 **Sintoma:** geometria, luzes, emissivos, letreiros e cabelo aparecem; pele, roupas, paredes e cenário ficam pretos, mesmo com luz forte ao lado.
 
-**Diagnóstico que separa as causas:** `VICTORY_NULL_MAGENTA=1` (feature `diagnostics`, [descriptor/host.rs:3928](<../crates/victory-gpu/src/descriptor/host.rs#L3928>)) pinta de magenta toda view nula. Superfície **magenta** = descritor ausente; superfície **preta** = descritor existe e a textura amostra zero.
+**Marcador diagnóstico:** `VICTORY_NULL_MAGENTA=1` (feature `diagnostics`, [descriptor/host.rs](<../crates/victory-gpu/src/descriptor/host.rs>)) substitui determinadas views nulas 2D de cor por magenta. Magenta é evidência de uso desse caminho, não uma medição direta de toda a área sem textura. Preto, por si só, não prova descritor válido nem amostragem zero: iluminação, composição, mapas e bindings também precisam ser verificados.
 
 Medição por imagem (fração de pixels rosados, comparando os mesmos offsets de cena entre runs):
 
@@ -264,7 +264,7 @@ A correção condiciona a saída da fila ao slot realmente feito:
 - `VICTORY_LIST_SLOTS=<hash do shader>` produz linhas `~slot` nos arquivos `*-ops.txt` da captura. **O hash esperado é o do shader** (o das seções `| <hash>:`), não o do cabeçalho `[vertex …, pixel …]` do draw; usar o do cabeçalho não gera nenhuma linha.
 - Só os frames de `listed()` geram `*-ops.txt` (`first+2`, `+6`, `+30`, `+80`); `VICTORY_CAPTURE_WORLD_EVERY` afeta apenas os PNGs.
 - `VICTORY_CARD_ACCOUNTING=1` imprime por slot onde está a memória e o estado da cópia host.
-- Contador de `fits()` recusado: mostrou **zero** recusas de formato, o que descarta sRGB/formato como causa dessas superfícies.
+- Contador de `fits()` recusado: mostrou **zero** recusas no caminho instrumentado. Isso NÃO descarta formato/sRGB incorreto nem confirma que todo slot passou por esse caminho.
 
 **Armadilha de operação:** `VICTORY_TABLED_TEXTURES=1` (manter tudo na fila) **piorou**: duas execuções caíram com quadros de 49–60 s e access violation antes do mundo. Tirar slots da fila é necessário; o defeito era tirá-los sem terem sido feitos.
 
@@ -285,6 +285,24 @@ A correção condiciona a saída da fila ao slot realmente feito:
 - Biblioteca rejeitada não é removida; recompila até um save com entradas novas.
 
 **Critério objetivo de “cache funciona”:** usar os contadores da **execução**, não a saída do `warm` — `loaded` com o mesmo tamanho do último `saved`, `made=0`, `misses=0`, `started_early>0`, nenhum `library rejected`.
+
+## 23. Triagem dos PRs upstream (26/11/2026)
+
+Fonte: [pull requests de myokex/victory-amd](https://github.com/myokex/victory-amd/pulls). Revisão em paralelo por dois subagentes; patches abertos não equivalem a correções validadas neste hardware.
+
+| PR | Relevância e estado local |
+|---|---|
+| [#6](https://github.com/myokex/victory-amd/pull/6) | Espera por pipeline para cada thread durante loading; candidato principal para passes descartados. Portado localmente preservando framelog; validação pendente. `VICTORY_PIPELINE_WAIT_OWN=0` permite controle A/B. |
+| [#14](https://github.com/myokex/victory-amd/pull/14) | Descritor nulo correto em heap de samplers. Aplicado localmente, ainda sem validação visual isolada. |
+| [#5](https://github.com/myokex/victory-amd/pull/5) | Evita criar um PSO específico associado a crash no driver AMD; aplicado localmente, não prova correção do AV no código do título. Pode omitir draws. |
+| [#19](https://github.com/myokex/victory-amd/pull/19) | Alinhamento >64 KiB em alocações 32-bit. Aplicado e testado em r40: mundo na primeira tentativa, 50 capturas; rosa 23,04% contra 20,38% em r39, nos 22 offsets comuns. Não demonstrou melhora; candidato a retirar do baseline visual. |
+| [#16](https://github.com/myokex/victory-amd/pull/16) | Serializa todo o ciclo de gravação da biblioteca; recomendado para cache, ainda não aplicado. |
+| [#15](https://github.com/myokex/victory-amd/pull/15) | Separa cache WARP/hardware; ainda não aplicado. Requer integração cuidadosa com #16. |
+| [#9](https://github.com/myokex/victory-amd/pull/9) | Esperas por escritas em voo/aliasing; exige port manual para preservar readbacks locais. Ainda não aplicado. |
+| [#4](https://github.com/myokex/victory-amd/pull/4) | Proteção contra autocópia já existe, ampliada, no tree local. Não reaplicar. |
+| [#22](https://github.com/myokex/victory-amd/pull/22) | Melhora diagnóstico concorrente da info queue; não corrige texturas diretamente. Ainda não aplicado. |
+
+**Limites das conclusões anteriores:** os 56% eram referências com `host=[null]`, não a interseção comprovada de nulo + fora da fila + cópia existente. A mudança em `table_entry` é uma hipótese de correção parcial, não causa raiz exclusiva comprovada. Offsets iguais após o marcador de mundo não garantem imagens da mesma cena; os percentuais acima são exploratórios. Duas quedas com `VICTORY_TABLED_TEXTURES=1` não estabelecem causalidade, pois há AV intermitente no boot também no controle. Comparações futuras devem usar capturas visualmente correspondentes, cache inicial idêntico e uma mudança por vez.
 
 ## Checklist antes de publicar um resultado
 
