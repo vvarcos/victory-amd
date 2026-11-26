@@ -254,7 +254,7 @@ Medição por imagem (fração de pixels rosados, comparando os mesmos offsets d
 | + `VICTORY_LEVELS_ON_DEMAND=1` | 10,0 % |
 | + correção de código que mantém slots não feitos na fila | 20,4 % (sem os ajustes acima) |
 
-**Causa raiz (com correção aplicada):** em [draw.rs:2906](<../crates/victory-gpu/src/draw.rs#L2906>), um draw que lia uma textura por tabela marcava o slot como “em dia” e o retirava da fila **sem verificar se o host conseguiu criar a view**. Quando a criação falhava por falta de VRAM, o slot ficava nulo **para sempre** e a textura nunca mais era tentada — exatamente o padrão `host=[null]` + `queue=[not queued]` observado em 56 % das referências.
+**Hipótese de recuperação incompleta:** em [draw.rs:2906](<../crates/victory-gpu/src/draw.rs#L2906>), a leitura por tabela marcava o slot como atendido sem conferir a cópia host atual. A alteração local verifica `texture_slot_made_from`. Revisão posterior confirmou que `tabled=false` preserva uma entrada já enfileirada, mas ainda atualiza o stamp que exclui alguns caminhos de descoberta/remapeamento por até 240 frames. Não garante reinserção de uma entrada ausente. Outro caminho, o de tabelas dinâmicas, ainda precisa de revisão equivalente. Os aproximadamente 56% medidos eram referências nulas, não a interseção nulo + fora da fila + cópia presente; não se demonstrou permanência em todos os casos.
 
 A correção condiciona a saída da fila ao slot realmente feito:
 `let made = host.texture_slot_made_from(index, handle); host.texture_slot_tabled(index, made);`
@@ -266,9 +266,9 @@ A correção condiciona a saída da fila ao slot realmente feito:
 - `VICTORY_CARD_ACCOUNTING=1` imprime por slot onde está a memória e o estado da cópia host.
 - Contador de `fits()` recusado: mostrou **zero** recusas no caminho instrumentado. Isso NÃO descarta formato/sRGB incorreto nem confirma que todo slot passou por esse caminho.
 
-**Armadilha de operação:** `VICTORY_TABLED_TEXTURES=1` (manter tudo na fila) **piorou**: duas execuções caíram com quadros de 49–60 s e access violation antes do mundo. Tirar slots da fila é necessário; o defeito era tirá-los sem terem sido feitos.
+**Experimento inconclusivo:** duas execuções com `VICTORY_TABLED_TEXTURES=1` caíram antes do mundo, com quadros de 49–60 s e AV. Como há AV intermitente também no controle, não se atribui causalidade à opção.
 
-**Estado:** correção medida e com efeito parcial (33,8 % → 20,4 % em A/B pareado). Ainda restam ~20 %; o próximo passo é combinar a correção com os ajustes de VRAM acima e medir de novo.
+**Estado:** houve diferença exploratória de rosa (33,8% → 20,4%), sem prova de cenas visualmente equivalentes ou cache inicial idêntico. Não representa redução comprovada da área sem textura. O wrapper antigo de retentativas usa junções de cache/dados compartilhados: não usar esse wrapper para A/B. O teste do PR #6 deve usar o mesmo executável, cópias físicas independentes com inventários SHA-256 iguais e apenas `VICTORY_PIPELINE_WAIT_OWN` variando. A revisão também identificou identidade de descritor registrada antes de `make()` ter sucesso; corrigir isso exige preservar o tratamento intencional de views nulas e evitar retentativas caras a cada draw.
 
 ## 22. Cache: o que está provado e o que falta
 
