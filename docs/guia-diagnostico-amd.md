@@ -129,9 +129,11 @@ Os saves são periódicos, sujeitos às condições do código. Matar o processo
 
 **Caminho existente:** no build diagnostics, `VICTORY_KEYS` combina botões programados com os do pad físico slot 0 por OR, preservando o estado físico. Sem pad físico, há o caminho fallback.
 
-**Descoberta posterior (verificada em 4 runs):** a tela “SELETOR DE CONTA” tem um botão (A) rotulado PLAYER, mas apertar A **enquanto essa tela está visível** terminou em access violation do título (`write 0x0` em `victory-image-<hash>.dll+0x2215c35`). Em três ocorrências o crash veio depois de um quadro de 12–50 s. Entradas enviadas **antes** dessa tela (por exemplo aos ~22–25 s) não o provocaram: o seletor acabou resolvendo sozinho e o jogo seguiu para carregamento.
+**Descoberta posterior (verificada em 5 runs):** a tela “SELETOR DE CONTA” tem um botão (A) rotulado PLAYER, mas apertar A **enquanto essa tela está visível** terminou em access violation do título (`write 0x0` em `victory-image-<hash>.dll+0x2215c35`). O mesmo endereço apareceu em outro run em que o A foi entregue cedo, ainda no boot. Em todos os casos o crash veio depois de um quadro de 12–50 s.
 
-**Regra prática:** não pressionar A com o seletor de conta na tela. Preferir uma entrada única cedo, antes do seletor, e esperar. Isso ainda é observação deste ambiente, não uma regra garantida em outra build.
+**O que sobreviveu de forma consistente:** a agenda fixa `VICTORY_KEYS=25:Enter,90:Enter,150:Enter` chegou ao mundo e sustentou 305–315 s em 4 execuções (com o controle físico ausente no boot). Isso não prova que a agenda seja segura em outra build; é a receita que funcionou aqui.
+
+**Regra prática:** não pressionar A no seletor de conta; preferir a agenda fixa já validada em vez de entradas pontuais no início do boot, até que a causa de `+0x2215c35` seja entendida. Isso é observação deste ambiente, não regra garantida.
 
 **Segunda descoberta:** conectar/desconectar o controle físico durante o jogo faz aparecer o modal “CONTROLE DESCONECTADO / Conecte um controle para jogar.”, que interrompe o jogo. Para runs de medição, mantenha o conjunto de dispositivos estável do início ao fim (controle ausente o tempo todo, ou presente o tempo todo). Isso não é uma exigência de uso do fork; é isolamento de variável experimental.
 
