@@ -1,6 +1,6 @@
 # Guia de diagnóstico AMD: problemas encontrados e soluções
 
-Este guia reúne descobertas de testes deste fork em Windows 10 (build 19045), Ryzen 5 5600G, Radeon RX 6600M de 8 GB e 16 GB de RAM. Os resultados são específicos desse ambiente e do binário/driver testados: **não constituem garantia de compatibilidade, desempenho ou estabilidade**.
+Este guia reúne descobertas de testes deste fork em Windows 10 (build 19045), Ryzen 5 5600G, Radeon RX 6600M de 8 GB e 32 GB de RAM. Os resultados são específicos desse ambiente e do binário/driver testados: **não constituem garantia de compatibilidade, desempenho ou estabilidade**.
 
 Use somente arquivos de jogo obtidos legalmente. Nenhum arquivo do jogo, save, shader extraído, dump ou cache binário é distribuído neste documento. Os comandos usam caminhos ilustrativos; adapte-os antes de executar.
 
