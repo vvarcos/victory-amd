@@ -148,7 +148,17 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // Every descriptor made while this call records — a draw's tables, the
+    // pass over the heap's buffer views, the textures it uploads — is made
+    // with the list current: a constant buffer whose title address is not
+    // 256-byte aligned gets its bytes staged for the view
+    // (`descriptor::host::HostHeap::staged_constant`). This is the outermost
+    // point that covers them all; a descriptor made outside any list (the
+    // passes that run when a submission is prepared) has no list to stage
+    // in and is refused, as before.
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    with_current(list, || f(list, &mut state));
+    drop(state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
@@ -180,6 +190,45 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     }
     // SAFETY: the title passes one of our lists.
     unsafe { (*this.cast::<List>()).host.as_ref() }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// The list recording on this thread, while a draw's descriptors are
+    /// made: a constant buffer whose title address is not 256-byte aligned
+    /// (the console needs 16, the host 256) has its bytes staged in memory
+    /// the heap owns, filled when this list is submitted
+    /// (`descriptor::host::HostHeap::staged_constant`, which takes the list
+    /// from [`current_list`]).
+    static RECORDING: std::cell::Cell<*const crate::host::HostList> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Runs `f` with `list` as the thread's recording list, restoring the one
+/// before it (a draw inside a draw's making is not a thing, but a list may
+/// record through several layers).
+#[cfg(windows)]
+pub(crate) fn with_current<R>(list: &crate::host::HostList, f: impl FnOnce() -> R) -> R {
+    let before = RECORDING.with(|c| c.replace(std::ptr::from_ref(list)));
+    struct Restore(*const crate::host::HostList);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECORDING.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(before);
+    f()
+}
+
+/// The list recording on this thread, if one is.
+#[cfg(windows)]
+pub(crate) fn current_list() -> Option<&'static crate::host::HostList> {
+    let at = RECORDING.with(std::cell::Cell::get);
+    if at.is_null() {
+        return None;
+    }
+    // SAFETY: set by `with_current` for the extent of the call `make` runs in.
+    Some(unsafe { &*at })
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits

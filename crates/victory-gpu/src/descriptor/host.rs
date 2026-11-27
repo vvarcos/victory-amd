@@ -118,6 +118,116 @@ pub(crate) struct HostHeap {
     forgotten: Mutex<(Vec<u32>, bool)>,
     /// Whether [`HostHeap::skip_begin`] ran for this heap.
     skip_live: std::sync::atomic::AtomicBool,
+    /// Constant views of title addresses the host cannot make a view of
+    /// where they are (not 256-byte aligned: the console needs 16, the host
+    /// 256): the upload memory the slot's view reads instead, kept with the
+    /// heap as long as the slot points there ([`HostHeap::staged_constant`]).
+    staged: Mutex<Staged>,
+}
+
+/// The upload memory of [`HostHeap::staged_constant`]: constant views whose
+/// title address is not 256-byte aligned are made over a copy here, whose
+/// addresses are. The copy is a region of a chunk, filled at submission with
+/// the title's bytes (the same `defer_fill` the fresh-table path uses,
+/// draw.rs) and filled again by every pass over the heap's buffer views
+/// ([`HostHeap::refill_staged`]) so content changed in place is seen.
+///
+/// The memory is the heap's, not a list's: a slot of the title's heap keeps
+/// pointing at it for as long as the title's record there, across lists,
+/// while a list's scratch is given back as soon as its list has run and
+/// would leave the slot reading another list's bytes.
+#[derive(Default)]
+struct Staged {
+    /// The chunks, front to back; a region never moves once placed.
+    chunks: Vec<StagedChunk>,
+    /// Bytes of the last chunk in use.
+    used: u64,
+    /// By descriptor slot (the CPU address of its host descriptor): where
+    /// its bytes are and the title memory they are filled from.
+    slots: std::collections::HashMap<usize, StagedSlot>,
+}
+
+struct StagedChunk {
+    buffer: ID3D12Resource,
+    /// Its persistent mapping.
+    data: usize,
+    gpu: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct StagedSlot {
+    chunk: usize,
+    offset: u64,
+    /// The title memory the bytes are filled from (the view's address now).
+    address: u64,
+    /// The view's size: the bytes filled.
+    size: u32,
+    /// The bytes of the region (the view's size rounded up to 256).
+    capacity: u64,
+}
+
+/// A staged-constants chunk: a constant buffer itself is at most 64 KiB, so
+/// a chunk holds many, and the regions are placed front to back.
+const STAGED_CHUNK: u64 = 1 << 20;
+
+/// The most upload memory one heap's staged constants take: title slots
+/// past this are refused (a null view, told once) rather than taking the
+/// card's memory without bound.
+const STAGED_MOST: u64 = 256 << 20;
+
+impl Staged {
+    /// Bytes placed over every chunk.
+    fn bytes(&self) -> u64 {
+        self.chunks.iter().map(|chunk| chunk.bytes).sum()
+    }
+
+    /// A region of `bytes` (a multiple of 256) — in the last chunk while it
+    /// fits, else in a new one — and the chunk and offset of it.
+    fn place(&mut self, host: &crate::host::Host, bytes: u64) -> Option<(usize, u64)> {
+        let last = self.chunks.last().map(|chunk| (chunk.bytes, self.used));
+        let new = match staged_region(last, bytes) {
+            Ok(offset) => {
+                self.used += bytes;
+                return Some((self.chunks.len() - 1, offset));
+            }
+            Err(new) => new,
+        };
+        if self.bytes() + new > STAGED_MOST {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    mb = STAGED_MOST >> 20,
+                    "staged constant views past the cap: their constant buffer views read nothing"
+                );
+            });
+            return None;
+        }
+        let (buffer, data) = host.upload_buffer(new)?;
+        crate::host::name(&buffer, || format!("staged constant views {new:#x}"));
+        // SAFETY: a live upload buffer, mapped for its whole size.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        self.chunks.push(StagedChunk {
+            buffer,
+            data: data as usize,
+            gpu,
+            bytes: new,
+        });
+        // The chunk holds the region as used, not the chunk: the next region
+        // goes on after it (a small region does not waste the chunk).
+        self.used = bytes;
+        Some((self.chunks.len() - 1, 0))
+    }
+}
+
+/// Where a region of `bytes` goes: at `used` in the last chunk (of its
+/// size) while it fits, else at the front of a new chunk of the returned
+/// size — [`STAGED_CHUNK`], or the region's own size when larger.
+fn staged_region(last: Option<(u64, u64)>, bytes: u64) -> Result<u64, u64> {
+    match last {
+        Some((chunk, used)) if used + bytes <= chunk => Ok(used),
+        _ => Err(bytes.max(STAGED_CHUNK)),
+    }
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -592,29 +702,77 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+    ///
+    /// The queue's counts ([`TextureQueue::census`]) come back from the
+    /// same walk over its slots.
+    fn due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        // One walk for both: the pass asks for the slots due and for the
+        // counts together, and the queue holds tens of thousands of slots.
+        let mut census = [self.slots.len() as u64, 0, 0, 0, 0];
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                census[3] += 1;
+            } else if w.looks > 0 {
+                census[2] += 1;
+            }
+            if w.due > frame {
+                continue;
+            }
+            census[1] += 1;
+            census[4] = census[4].max(frame.saturating_sub(w.written));
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
+        if max == 0 {
+            return (Vec::new(), census);
+        }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // Only what this pass hands out is put in order. A backlog is tens
+        // of thousands of slots (run 52) for some 4,096 slots a pass:
+        // sorting all of them cost the recording thread 2-4 ms a pass, to
+        // take a prefix of `max` that one walk finds (`select_nth_unstable`
+        // is linear). The order handed out is the one the full sort gave:
+        // `again` first, newest first; then the others, newest and oldest
+        // in turns.
+        let used_again = again.len().min(max);
+        if again.len() > used_again {
+            again.select_nth_unstable_by(used_again, newest_first);
+            again.truncate(used_again);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        // The slots never looked at: `ceil(need/2)` of the newest and
+        // `floor(need/2)` of the oldest, in that order.
+        let n = fresh.len();
+        let need = max.saturating_sub(again.len()).min(n);
+        let k_new = need.div_ceil(2);
+        let k_old = need - k_new;
+        if k_new < n {
+            fresh.select_nth_unstable_by(k_new, newest_first);
+        }
+        fresh[..k_new].sort_unstable_by(newest_first);
+        {
+            // The oldest `k_old` lie at the end of what is left, in order.
+            let tail = &mut fresh[k_new..];
+            let from = tail.len() - k_old;
+            if k_old > 0 && k_old < tail.len() {
+                tail.select_nth_unstable_by(from, newest_first);
+            }
+            tail[from..].sort_unstable_by(newest_first);
+        }
+        let mut order = Vec::with_capacity(again.len() + need);
+        order.extend(again.iter().map(|&(_, index, write)| (index, write)));
+        for j in 0..k_new {
+            order.push((fresh[j].1, fresh[j].2));
+            if j < k_old {
+                // Oldest first: the last of the selected oldest run.
+                let at = fresh.len() - 1 - j;
+                order.push((fresh[at].1, fresh[at].2));
             }
         }
-        order.truncate(max);
-        order
+        (order, census)
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -715,6 +873,9 @@ impl TextureQueue {
     /// For the frame line: slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
+    /// The texture pass takes these from [`TextureQueue::due`], which walks
+    /// the queue once for both; this is the plain form, for tests.
+    #[allow(dead_code)]
     fn census(&self, frame: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
@@ -1040,6 +1201,7 @@ impl HostHeap {
             skip: Mutex::default(),
             forgotten: Mutex::default(),
             skip_live: std::sync::atomic::AtomicBool::new(false),
+            staged: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1193,7 +1355,7 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due(frame, max)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -1560,6 +1722,8 @@ impl HostHeap {
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
         self.set_now(index, 0);
+        // A staged constant buffer the slot read is no longer read there.
+        self.forget_staged(self.cpu(index).ptr);
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -1962,6 +2126,120 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+    }
+
+    /// Makes the title's slot `index` from `view`, where [`make`] cannot
+    /// make it there: a constant buffer whose title address is not 256-byte
+    /// aligned (the console aligns one to 16) is made over a copy of its
+    /// bytes in this heap's own upload memory ([`HostHeap::staged_constant`]).
+    /// Every other view is [`make`]'s, as before.
+    fn make_slot(&self, index: u32, view: &View) -> Option<Kept> {
+        let at = self.cpu(index);
+        if let &View::Constant(address, size) = view
+            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+            && shadow.gpu(address) % 256 != 0
+        {
+            return self.staged_constant(address, size, at);
+        }
+        if matches!(view, View::Constant(..)) {
+            // The slot no longer reads the staged copy (the record is
+            // aligned now, or has no host copy): stop filling it.
+            self.forget_staged(at.ptr);
+        }
+        make(view, at)
+    }
+
+    /// Makes slot `at` a constant buffer view of the title's bytes at
+    /// `address` (`size` bytes), over upload memory of this heap that is
+    /// 256-byte aligned: the bytes are copied there when the recording list
+    /// is submitted ([`crate::host::HostList::defer_fill`]) and again at
+    /// every pass over the heap's buffer views ([`HostHeap::refill_staged`]).
+    /// The heap keeps the memory for the life of the slot's record, which is
+    /// what the descriptor of a title heap slot needs (a list's scratch goes
+    /// back to the pool as soon as that list has run).
+    ///
+    /// `None` outside a recording list (there is nothing to copy the bytes
+    /// with) or past [`STAGED_MOST`]: the slot is left null, as before.
+    fn staged_constant(
+        &self,
+        address: u64,
+        size: u32,
+        at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<Kept> {
+        let Some(host) = host() else { return None };
+        let Some(list) = crate::list::current_list() else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "a constant buffer view not 256-byte aligned was made outside a recording list: it reads nothing"
+                );
+            });
+            return None;
+        };
+        let want = u64::from(constant_size(size));
+        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        let key = at.ptr;
+        let (chunk, offset, capacity) = match staged.slots.get(&key) {
+            // A slot keeps its region for as long as the view fits it: only
+            // the bytes and the title address change from record to record.
+            Some(slot) if slot.capacity >= want => (slot.chunk, slot.offset, slot.capacity),
+            _ => {
+                let (chunk, offset) = staged.place(host, want)?;
+                (chunk, offset, want)
+            }
+        };
+        let region = &staged.chunks[chunk];
+        let (data, gpu) = (region.data, region.gpu + offset);
+        let buffer = region.buffer.clone();
+        staged.slots.insert(
+            key,
+            StagedSlot { chunk, offset, address, size, capacity },
+        );
+        drop(staged);
+        // SAFETY: our own upload memory, mapped for its whole size; the
+        // title memory is copied at submission, as the fresh-table path
+        // does (`draw.rs`, `State::tables`).
+        list.defer_fill((data + offset as usize) as *mut u8, address as *const u8, size as usize);
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_size(size),
+        };
+        // SAFETY: a slot of our heap; the range is in our upload memory.
+        unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = constant_views::STAGED.fetch_add(1, Relaxed) + 1;
+            // The first says staging is in use at all; then every 1,024.
+            if n == 1 || n.is_multiple_of(1024) {
+                constant_views::report();
+            }
+        }
+        Some(Some(buffer))
+    }
+
+    /// Slot `at` (a title slot) no longer reads a staged copy of its
+    /// constant buffer.
+    fn forget_staged(&self, at: usize) {
+        let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if !staged.slots.is_empty() {
+            staged.slots.remove(&at);
+        }
+    }
+
+    /// Fills the staged constant buffers again from the title memory they
+    /// view: the title writes the constants of a material in place, so a
+    /// view of them that was right at its record is stale the next frame.
+    /// Called by the pass over the heap's buffer views, once per pass, as
+    /// `draw::State::heap_refresh` does for the host copies of aligned ones.
+    pub(crate) fn refill_staged(&self, list: &crate::host::HostList) {
+        let staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in staged.slots.values() {
+            let chunk = &staged.chunks[slot.chunk];
+            // SAFETY: our own upload memory at the region the view reads.
+            let to = (chunk.data + slot.offset as usize) as *mut u8;
+            list.defer_fill(to, slot.address as *const u8, slot.size as usize);
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2615,6 +2893,8 @@ impl HostHeap {
                 if made[index as usize] != 0 {
                     made[index as usize] = 0;
                     self.make_null(index);
+                    // A staged constant buffer the slot read is no longer read.
+                    self.forget_staged(self.cpu(index).ptr);
                     let _ = self.note_buffer(index, None, false, echo);
                     *self_changed = true;
                 } else if for_draw {
@@ -2665,7 +2945,7 @@ impl HostHeap {
                         let kept = if later {
                             None
                         } else {
-                            make(&view, self.cpu(index))
+                            self.make_slot(index, &view)
                         };
                         if kept.is_none() && !self.sampler {
                             let kind = null_kind(&view);
@@ -3583,6 +3863,17 @@ fn casts_fully_typed() -> bool {
     })
 }
 
+/// sRGB views of title textures and how the host met them, since the start:
+/// `[0]` kept their colour space (the host casts fully typed formats, or the
+/// host copy is typeless and names the title's format), `[1]` took the
+/// texture's linear format because the host does not cast typed formats,
+/// `[2]` were unordered views that asked for an sRGB format (the host has no
+/// sRGB unordered access: they read and write the linear twin, and the
+/// encode such a store does on the console is not ours to make). Reported
+/// with the frame statistics.
+pub(crate) static SRGB_VIEWS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Checks the texture's flags and chooses a compatible format for its shader
 /// (or unordered access) view: `d` is the texture's description, `format` the
 /// view's (none: the texture's own), and `casts_fully_typed` whether the host
@@ -3591,16 +3882,19 @@ fn casts_fully_typed() -> bool {
 /// views without the resource's permission, of typed depth, and in another
 /// format than a typed resource's. A view of a typed texture in another
 /// format of its family takes the texture's format, except an sRGB/linear
-/// pair ([`srgb_pair`]) on a host that casts fully typed formats: the view
-/// keeps its colour space. Unordered views always take the texture's linear
-/// format (the host has no sRGB unordered access).
+/// pair ([`crate::resource::srgb_pair`]) on a host that casts fully typed
+/// formats: the view keeps its colour space. A typeless host copy takes the
+/// view's own format (the title's, [`crate::resource::view_format`]).
+/// Unordered views always take the texture's linear format (the host has no
+/// sRGB unordered access), and one the host cannot store in a typed view is
+/// refused ([`typed_store`]).
 fn fits(
     d: D3D12_RESOURCE_DESC,
     mut format: Option<&mut DXGI_FORMAT>,
     unordered: bool,
     casts_fully_typed: bool,
 ) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+    use crate::resource::{DEPTH_FORMATS, family, linear_twin, srgb_pair};
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     } else {
@@ -3621,11 +3915,12 @@ fn fits(
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
+    // The sRGB format the title asked for, before anything rewrites it.
+    let asked = format.as_deref().map_or(0, |f| f.0 as u32);
+    let srgb_asked = linear_twin(asked).is_some();
     if let Some(format) = format.as_deref_mut()
         && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
+        && let Some(linear) = linear_twin(format.0 as u32)
     {
         format.0 = linear as i32;
     }
@@ -3645,22 +3940,156 @@ fn fits(
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
+    // The format the view takes; a format the host cannot store typed
+    // unordered access in is an invalid call, which removes the device
+    // (B5G5R5A1_UNORM, the menu's, 2026-11-25: ScarlettPort's f4fe7c9b).
+    // shortcut: such views are null and their writes dropped; map the
+    // format to one the host can store (of the same bit width) when the
+    // world needs them.
+    let effective = if typeless { view } else { own };
+    if unordered && !typed_store(effective) {
+        once!(
+            view = effective,
+            own,
+            "an unordered view in a format the host cannot store typed"
+        );
+        return false;
+    }
+    if let Some(format) = format.as_deref_mut()
         && !typeless
         && view != own
         && (unordered || !casts_fully_typed || !srgb_pair(own, view))
     {
-        *format = d.Format;
+        // An unordered view never names an sRGB format: the host has none,
+        // and the call would remove the device. It takes the texture's
+        // linear twin instead (the block above chose it when the title asked
+        // for the sRGB format itself).
+        *format = match linear_twin(d.Format.0 as u32) {
+            Some(linear) if unordered => DXGI_FORMAT(linear as i32),
+            _ => d.Format,
+        };
+    }
+    if srgb_asked {
+        // Kept its colour space, or lost it (and why). The stand-in targets
+        // and other families never get here with an sRGB format asked for.
+        let lost = format.as_ref().map(|f| f.0 as u32) != Some(asked);
+        let i = if unordered {
+            2
+        } else {
+            usize::from(lost)
+        };
+        SRGB_VIEWS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     true
 }
 
-/// Whether `own` and `view` are the sRGB and linear formats of one texture
-/// family: the pairs [`crate::resource::SRGB`] names, the host's own
-/// (RGBA8, BGRA8, BGRX8, BC1, BC2, BC3 and BC7).
-fn srgb_pair(own: u32, view: u32) -> bool {
-    let pair = (own.max(view), own.min(view));
-    crate::resource::SRGB.contains(&pair)
+/// Whether the host stores to typed unordered views of `format`
+/// (`D3D12_FEATURE_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW`), asked once
+/// per format. Ported from ScarlettPort f4fe7c9b: the console's GPU stores
+/// to formats the host refuses, and the call that would say so removes the
+/// device, so the view is left null instead.
+pub(crate) fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let Some(host) = host() else {
+        // No device to ask (unit tests): nothing to refuse.
+        return true;
+    };
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a structure of its size.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+    known.push((format, ok));
+    ok
+}
+
+/// A shader view of a texture whose host copy had to be made typeless for
+/// its sRGB format ([`crate::resource::texture_srgb_typeless`]) and that the
+/// title views without a description: the title's own (sRGB) format,
+/// spelled out over all mips and slices, which is what the host gives a
+/// typed copy, and the only view that decodes the texels the title wrote
+/// through its unordered access. Without it the view would stay null: the
+/// host has no implicit format for a typeless resource.
+fn srgb_srv_desc(d: &D3D12_RESOURCE_DESC, format: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let texture2d = d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && d.DepthOrArraySize <= 1;
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(format as i32),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+            MostDetailedMip: 0,
+            MipLevels: u32::MAX,
+            ResourceMinLODClamp: 0.0,
+        };
+    } else if texture2d {
+        desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MostDetailedMip: 0,
+            MipLevels: u32::MAX,
+            PlaneSlice: 0,
+            ResourceMinLODClamp: 0.0,
+        };
+    } else {
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+            MostDetailedMip: 0,
+            MipLevels: u32::MAX,
+            FirstArraySlice: 0,
+            ArraySize: u32::from(d.DepthOrArraySize),
+            PlaneSlice: 0,
+            ResourceMinLODClamp: 0.0,
+        };
+    }
+    desc
+}
+
+/// [`srgb_srv_desc`]'s unordered access twin: the same format, which the
+/// view checks turn into the linear one (the host has no sRGB unordered
+/// access), and the same mip 0 of every slice.
+fn srgb_uav_desc(d: &D3D12_RESOURCE_DESC, format: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT(format as i32),
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+            MipSlice: 0,
+            FirstWSlice: 0,
+            WSize: u32::MAX,
+        };
+    } else if d.DepthOrArraySize > 1 {
+        desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+            MipSlice: 0,
+            FirstArraySlice: 0,
+            ArraySize: u32::from(d.DepthOrArraySize),
+            PlaneSlice: 0,
+        };
+    } else {
+        desc.Anonymous.Texture2D = D3D12_TEX2D_UAV {
+            MipSlice: 0,
+            PlaneSlice: 0,
+        };
+    }
+    desc
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -3730,6 +4159,27 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Counts of the constant views made for draws, and why (diagnostics): those
+/// made where the title has them, those whose bytes had to be staged in a
+/// heap's upload memory (the title's address is not 256-byte aligned), and
+/// those whose buffer has no host copy. Reported every few thousand, so a
+/// run says whether the material constants are read or are a null view.
+#[cfg(feature = "diagnostics")]
+mod constant_views {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub(super) static MADE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static STAGED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static NO_COPY: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn report() {
+        tracing::info!(
+            made = MADE.load(Relaxed),
+            staged = STAGED.load(Relaxed),
+            no_host_copy = NO_COPY.load(Relaxed),
+            "constant views"
+        );
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3741,58 +4191,39 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // colour, roughness and transforms: a null constant view is a
             // black material. Counted by reason, so the run says whether
             // that is what the dark surfaces see.
-            #[cfg(feature = "diagnostics")]
-            {
-                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-                static OK: AtomicU64 = AtomicU64::new(0);
-                static UNALIGNED: AtomicU64 = AtomicU64::new(0);
-                static NO_SHADOW: AtomicU64 = AtomicU64::new(0);
-                static COUNTED: AtomicU64 = AtomicU64::new(0);
-                let report = |ok: u64, unaligned: u64, none: u64| {
-                    tracing::info!(
-                        made = ok,
-                        unaligned,
-                        no_host_copy = none,
-                        "constant views made for draws"
-                    );
-                };
-                let shadow = crate::shadow::find(address, u64::from(size));
-                if shadow.is_none() {
-                    let n = NO_SHADOW.fetch_add(1, Relaxed) + 1;
-                    if COUNTED.fetch_add(1, Relaxed).is_multiple_of(512) {
-                        report(
-                            OK.load(Relaxed),
-                            UNALIGNED.load(Relaxed),
-                            n,
-                        );
+            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let n = constant_views::NO_COPY.fetch_add(1, Relaxed) + 1;
+                    if n.is_multiple_of(512) {
+                        constant_views::report();
                     }
-                    return None;
                 }
-                let gpu = shadow.as_ref().map_or(0, |s| s.gpu(address));
-                if gpu % 256 != 0 {
-                    let n = UNALIGNED.fetch_add(1, Relaxed) + 1;
-                    if COUNTED.fetch_add(1, Relaxed).is_multiple_of(512) {
-                        report(OK.load(Relaxed), n, NO_SHADOW.load(Relaxed));
-                    }
-                    once!(
-                        address = format_args!("{address:#x}"),
-                        "constant buffer not 256-byte aligned on the host"
-                    );
-                    return None;
-                }
-                OK.fetch_add(1, Relaxed);
-                if COUNTED.fetch_add(1, Relaxed).is_multiple_of(4096) {
-                    report(OK.load(Relaxed), UNALIGNED.load(Relaxed), NO_SHADOW.load(Relaxed));
-                }
-            }
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+                return None;
+            };
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
+                // The console aligns a constant buffer to 16 bytes; the
+                // host's views need 256. The paths that can stage it do: a
+                // draw's fresh tables copy the bytes to the list's scratch
+                // (`State::tables`, `constant_at`), and a title heap slot
+                // (`HostHeap::make_slot`) to upload memory of its heap. What
+                // is left here is a slot of another kind (a dynamic one, or
+                // a texture view remade): refused, as before.
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
                 return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let n = constant_views::MADE.fetch_add(1, Relaxed) + 1;
+                if n.is_multiple_of(4096) {
+                    constant_views::report();
+                }
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
@@ -3832,6 +4263,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 // SAFETY: the texture is live for this view creation.
                 let resource_desc = unsafe { texture.GetDesc() };
+                // A texture the host could only make typeless for its sRGB
+                // format ([`crate::resource::texture_srgb_typeless`]) and a
+                // view of it without a description: the host needs the
+                // format spelled out, and the title's own decodes. Before
+                // this, such a view was refused (a typeless copy has no
+                // implicit format) and the draw read nothing.
+                if desc.is_none()
+                    && let Some(format) = crate::resource::texture_srgb_typeless(resource)
+                {
+                    desc = Some(srgb_srv_desc(&resource_desc, format));
+                    crate::resource::SRGB_TYPELESS[1]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if !fits(
                     resource_desc,
                     desc.as_mut().map(|d| &mut d.Format),
@@ -3947,6 +4391,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: the texture (or its depth twin) is live.
             let resource_desc = unsafe { texture.GetDesc() };
+            // A texture the host could only make typeless for its sRGB
+            // format, written without a description: as for the shader view
+            // above, the title's own format is spelled out (the view checks
+            // make it the linear one, the only unordered access the host
+            // has). Before this, such a write went nowhere.
+            if desc.is_none()
+                && let Some(format) = crate::resource::texture_srgb_typeless(resource)
+            {
+                desc = Some(srgb_uav_desc(&resource_desc, format));
+                crate::resource::SRGB_TYPELESS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if !fits(
                 resource_desc,
                 desc.as_mut().map(|d| &mut d.Format),
@@ -4725,37 +5180,37 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100).0.into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
+        assert_eq!(q.due(9, 2).0.len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).0.iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100).0.iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100).0[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100).0.iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100).0[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100).0[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -4763,11 +5218,11 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100).0.iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100).0.iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100).0.iter().any(|d| d.0 == 98));
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -4780,26 +5235,80 @@ mod tests {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let due = q.due(1, 100).0;
         assert_eq!(due.len(), 4);
         // The card is full: slots 20 and 21 are held back until frame 101.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
             q.hold(index, write, 101);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 100).0.into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
         assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
         // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.due(101, 100).0, due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 100).0.iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 100).0.iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// The queue hands out `max` slots from a backlog of hundreds in the
+    /// order the full sort gave; the counts come from the same walk.
+    #[test]
+    fn a_backlog_is_selected_without_sorting_all_of_it() {
+        // The form the pass served before the selection was linear: sort
+        // every due slot, then hand out `max` of them.
+        fn served_by_sorting(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+            let mut again: Vec<(u64, u32, u64)> = Vec::new();
+            let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+            for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
+                let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+                class.push((w.written, index, w.write));
+            }
+            let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+            again.sort_unstable_by(newest_first);
+            fresh.sort_unstable_by(newest_first);
+            let mut order: Vec<(u32, u64)> =
+                again.iter().map(|&(_, index, write)| (index, write)).collect();
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old && order.len() < max {
+                order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+                if new < old && order.len() < max {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                }
+            }
+            order.truncate(max);
+            order
+        }
+        let mut q = TextureQueue::default();
+        // 600 slots written in turns, a third of them looked at before, some
+        // uploaded in part, some due later than the frame looked at.
+        let mut write_of = std::collections::BTreeMap::new();
+        for i in 0..600u32 {
+            q.written(1000 + i, 1, 0, false);
+            write_of.insert(1000 + i, q.slots[&(1000 + i)].write);
+        }
+        for i in (0..600u32).step_by(3) {
+            let write = write_of[&(1000 + i)];
+            q.later(1000 + i, write, 5, 256);
+        }
+        for i in (1..600u32).step_by(7) {
+            let write = write_of[&(1000 + i)];
+            q.partly(1000 + i, write, 5, 4096);
+        }
+        q.written(4999, 1, 900, false);
+        for max in [1, 2, 3, 7, 100, 257, 600, 4096, 100_000] {
+            assert_eq!(q.due(10, max).0, served_by_sorting(&q, 10, max), "max {max}");
+        }
+        assert_eq!(q.due(10, 128).1, q.census(10));
+        assert_eq!(q.due(10, 0).0, Vec::new());
     }
 
     /// Textures of which only the smallest levels are held, packed into
@@ -5389,5 +5898,33 @@ mod sync_skip_tests {
             assert_eq!(made(&full), made(&skipping), "made slots after step {step}");
         }
         assert!(left.iter().all(|&n| n > 0), "every kind of skip was made: {left:?}");
+    }
+}
+
+#[cfg(test)]
+mod staged_tests {
+    use super::{STAGED_CHUNK, staged_region};
+
+    /// Where a staged constant region goes ([`super::Staged`]): the first
+    /// starts a chunk of its own, the next follows it (taking its bytes of
+    /// the chunk, not the chunk), the last 256 bytes of a chunk still fit
+    /// and one byte more does not, and a region past a chunk's size gets a
+    /// chunk of its own. Every offset is a whole 256, as a constant buffer
+    /// view needs.
+    #[test]
+    fn regions_follow_each_other_in_chunks() {
+        assert_eq!(staged_region(None, 256), Err(STAGED_CHUNK));
+        assert_eq!(staged_region(Some((STAGED_CHUNK, 256)), 512), Ok(256));
+        let end = STAGED_CHUNK - 512;
+        assert_eq!(staged_region(Some((STAGED_CHUNK, end)), 512), Ok(end));
+        assert_eq!(staged_region(Some((STAGED_CHUNK, end)), 768), Err(STAGED_CHUNK));
+        let big = STAGED_CHUNK + 256;
+        assert_eq!(staged_region(None, big), Err(big));
+        assert_eq!(staged_region(Some((STAGED_CHUNK, 0)), big), Err(big));
+        for used in [0, 256, 1024, STAGED_CHUNK - 256] {
+            let offset = staged_region(Some((STAGED_CHUNK, used)), 256).expect("the chunk has room");
+            assert_eq!(offset, used);
+            assert_eq!(offset % 256, 0);
+        }
     }
 }

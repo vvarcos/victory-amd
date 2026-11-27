@@ -7904,16 +7904,49 @@ impl Host {
     }
 }
 
-/// The swap chain formats a presented texture can be copied into: its own
-/// family's.
+/// The swap chain format a presented texture can be copied into: its own
+/// family's. A copy between two formats of one family is bit for bit (only
+/// the scanout or the view of the copy decides what the bits mean), so an
+/// sRGB texture presented as its linear twin keeps exactly the texels the
+/// title wrote: the title's last pass either encodes itself or renders to
+/// the sRGB target, and the desktop treats 8-bit SDR content as
+/// sRGB-encoded either way. See [`srgb_present`] for the switch that names
+/// the sRGB twin instead.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
-    Some(match format.0 {
+    swap_format_of(format, srgb_present())
+}
+
+/// [`swap_format`] for a choice of swap chain colour space (`srgb`:
+/// [`srgb_present`]).
+fn swap_format_of(format: DXGI_FORMAT, srgb: bool) -> Option<DXGI_FORMAT> {
+    let swap = match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
-    })
+    };
+    // The sRGB twin of the swap chain's format, for the formats that have
+    // one (R10G10B10A2 and R16G16B16A16F have none). The texels are the
+    // same: what changes is the colour space the back buffer is named in.
+    match (srgb, swap.0) {
+        (true, 28) => Some(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+        (true, 87) => Some(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+        _ => Some(swap),
+    }
+}
+
+/// `VICTORY_SRGB_PRESENT=1`: make the swap chain in the sRGB format of the
+/// presented texture's family instead of the linear one. It cannot change
+/// the picture of a title that presents a texture whose bits are already
+/// encoded — the copy is bit for bit — and it is the format a present that
+/// encodes in a shader would need (a linear title texture rendered onto an
+/// sRGB back buffer). Off by default: an sRGB back buffer that a linear
+/// copy lands in would be read as linear by anything that renders to it,
+/// and nothing does today.
+fn srgb_present() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SRGB_PRESENT").is_some_and(|v| v == "1"))
 }
 
 const BUFFERS: u32 = 2;
@@ -8323,7 +8356,7 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(width, height, format, desc.Format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -8456,6 +8489,7 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
+        title: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,

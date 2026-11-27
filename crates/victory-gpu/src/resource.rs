@@ -116,15 +116,20 @@ const TEXTURE_3D: u32 = 4;
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
 /// depth with 8-bit stencil, two planes: 3 bytes per texel), 189 (signed
-/// 10-bit color), 190 (two 4-bit channels) and 191 (24/8 color).
+/// 10-bit color), 190 (two 4-bit channels) and 191 (A4B4G4R4: four 4-bit
+/// channels, so 2 bytes a texel). 191 was counted among the four-byte
+/// formats here, and [`victory_formats::texture::format`] sizes it at two:
+/// the latter is what ScarlettPort's be7717f measured ("A4B4G4R4_UNORM
+/// (191) is 2 bytes a texel"), and the two must agree, since a texture's
+/// size comes from the layout and its copies from the element.
 pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     Some(match format {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
         9..=22 => (8, 1),
-        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 68 | 69 | 85 | 86 | 115 | 191 => (2, 1),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
@@ -626,6 +631,46 @@ pub(crate) const SRGB: [(u32, u32); 7] = [
     (78, 77),
     (99, 98),
 ];
+
+/// The linear twin of an sRGB format, if `format` is one ([`SRGB`]).
+pub(crate) fn linear_twin(format: u32) -> Option<u32> {
+    SRGB.iter()
+        .find(|&&(srgb, _)| srgb == format)
+        .map(|&(_, linear)| linear)
+}
+
+/// Whether `own` and `view` are the sRGB and linear formats of one texture
+/// family: the pairs [`SRGB`] names.
+pub(crate) fn srgb_pair(own: u32, view: u32) -> bool {
+    SRGB.contains(&(own.max(view), own.min(view)))
+}
+
+/// The title's own format, when the host copy of a texture of that format
+/// `own` had to be made typeless for it (`host`): the sRGB textures the
+/// title also writes through unordered access, which the host has no sRGB
+/// view for (`host_texture_in`). A view of such a copy without a
+/// description must name the title's format, which for a host copy that is
+/// typeless no longer comes from the resource ([`view_format`]).
+pub(crate) fn srgb_typeless_format(own: u32, host: u32) -> Option<u32> {
+    (host == family(own) && host != own && linear_twin(own).is_some()).then_some(own)
+}
+
+/// [`srgb_typeless_format`] of a title texture, in its host copy's format:
+/// `None` if it has no host copy, or that copy is typed (or typeless for
+/// another reason: a depth texture).
+pub(crate) fn texture_srgb_typeless(this: This) -> Option<u32> {
+    let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
+    // SAFETY: a live resource.
+    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    srgb_typeless_format(own, format)
+}
+
+/// How many title textures were made typeless for an sRGB format with
+/// unordered access, and how many views of them without a description took
+/// the title's format from [`texture_srgb_typeless`] (diagnostics).
+pub(crate) static SRGB_TYPELESS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -2464,9 +2509,14 @@ fn host_texture_in(
         d.format = typeless;
     }
     // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+    // their unordered access views plain UNORM. The title's own format is
+    // then not the resource's, and a view of it without a description takes
+    // it from `srgb_typeless_format`. (The bits are the title's either way,
+    // as the console's own unordered view of an sRGB texture can only be
+    // the linear format too.)
+    if d.flags & UNORDERED != 0 && linear_twin(d.format).is_some() {
         d.format = family(d.format);
+        SRGB_TYPELESS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).

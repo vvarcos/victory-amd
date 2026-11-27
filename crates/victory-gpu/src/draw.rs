@@ -346,8 +346,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// dynamic slot. Hashed quickly ([`QuickHash`]): the contents are mixed
+    /// by [`table_key_word`] and the key itself is of an address and two
+    /// numbers, so a SipHash of both was two per-draw costs for no safety:
+    /// this map is looked at once per table a draw binds.
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32, QuickHash>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -587,6 +590,29 @@ impl std::hash::Hasher for Quick {
     fn finish(&self) -> u64 {
         self.0
     }
+}
+
+/// The contents of a fresh table as one word, for its cache key
+/// (`State::tables`): the title's first three words of each record, twelve
+/// bytes of the thirty-two a record takes.
+///
+/// Two multiplies a record, not a SipHash: the world binds tables of
+/// hundreds of records, once per draw, and the twelve bytes are read anyway
+/// (they say which views and constants the table holds). The key is not a
+/// security boundary: it only has to tell one table's contents from
+/// another's within a list, and the map compares the whole key.
+fn table_key_word(table: u64, n: u32, records: impl Iterator<Item = [u32; 3]>) -> u64 {
+    // The table and its length first: two tables of one *record count* and
+    // content are still two tables.
+    let mut h = table ^ (u64::from(n) << 48);
+    for [a, b, c] in records {
+        let low = u64::from(a) | u64::from(b) << 32;
+        h = (h ^ low).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^= h >> 29;
+        h = (h ^ u64::from(c)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        h ^= h >> 32;
+    }
+    h
 }
 
 /// Textures brought up to date for shaders that pick them by index
@@ -1243,7 +1269,21 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // At most 64 dwords of root constants to a parameter (the
+                // host's limit), so a stack buffer does for every stage: a
+                // `vec!` here was one heap allocation a stage of every
+                // draw, some 10,000 a frame in the world (and, in
+                // diagnostics builds, four atomics of the counting
+                // allocator each).
+                const MOST: usize = 64;
+                let mut stack = [0u32; MOST];
+                let mut fallback = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= MOST {
+                    &mut stack[..dwords as usize]
+                } else {
+                    fallback.resize(dwords as usize, 0);
+                    &mut fallback
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1855,6 +1895,11 @@ impl State {
             Ordering::Relaxed,
         );
         let textures_began = std::time::Instant::now();
+        // Constant buffers whose title address is not 256-byte aligned are
+        // staged in the heap's own upload memory (see `HostHeap::staged`):
+        // the title may rewrite them in place, so they are filled again
+        // every pass, as the aligned host copies are refreshed.
+        host.refill_staged(list);
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -2940,6 +2985,20 @@ impl State {
         indexed: &[RootIndexedView],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        // The descriptors this makes may hold constant buffers whose title
+        // address is not 256-byte aligned (the console needs 16): the host
+        // copy's bytes are staged in this list's scratch to give the view an
+        // aligned address, so `make` needs the list that is recording.
+        crate::list::with_current(list, || self.tables_in(list, used, indexed, compute))
+    }
+
+    fn tables_in(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -3025,16 +3084,12 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
+            let records = (0..n).map(|k| {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                unsafe { (at as *const [u32; 3]).read_unaligned() }
+            });
+            let key = (table, n, table_key_word(table, n, records));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -4105,5 +4160,34 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// The cache key of a fresh table names its contents: two looks at the
+    /// same records give the same word, and one record written differently
+    /// (or the same records at another table, or one more of them) gives
+    /// another.
+    #[test]
+    fn a_table_key_names_its_contents() {
+        let records = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+        let key = |table: u64, n: u32, records: &[[u32; 3]]| {
+            table_key_word(table, n, records.iter().copied())
+        };
+        assert_eq!(key(0x1000, 3, &records), key(0x1000, 3, &records));
+        // A record's third word differs, then its first.
+        let mut changed = records;
+        changed[1][2] = 7;
+        assert_ne!(key(0x1000, 3, &records), key(0x1000, 3, &changed));
+        let mut changed = records;
+        changed[0][0] = 0;
+        assert_ne!(key(0x1000, 3, &records), key(0x1000, 3, &changed));
+        // The same contents at another table, or with one more record.
+        assert_ne!(key(0x1000, 3, &records), key(0x2000, 3, &records));
+        assert_ne!(key(0x1000, 3, &records), key(0x1000, 4, &records));
+        // The order of the records is part of the contents.
+        let reversed = [records[2], records[1], records[0]];
+        assert_ne!(key(0x1000, 3, &records), key(0x1000, 3, &reversed));
+        // An empty table is still told by its table and length.
+        assert_eq!(key(0x1000, 0, &[]), key(0x1000, 0, &[]));
+        assert_ne!(key(0x1000, 0, &[]), key(0x2000, 0, &[]));
     }
 }
