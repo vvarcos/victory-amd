@@ -1566,9 +1566,13 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
+            match view_at(key as u32, (key >> 32) as u32) {
+                Some(view) => null_for(&view, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
         }
         self.keep(index, None);
     }
@@ -3739,6 +3743,27 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                    // Why a slot a draw reads stays null although the
+                    // texture's host copy exists: the view does not fit it.
+                    // Counted by the reason the two descriptions give.
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                        static NO_FIT: AtomicU64 = AtomicU64::new(0);
+                        // SAFETY: a live resource.
+                        let own = unsafe { texture.GetDesc() }.Format.0;
+                        let asked = desc.as_ref().map_or(0, |d| d.Format.0);
+                        let n = NO_FIT.fetch_add(1, Relaxed) + 1;
+                        if n <= 20 || n.is_multiple_of(500) {
+                            tracing::info!(
+                                so_far = n,
+                                resource = ?resource,
+                                host_format = own,
+                                view_format = asked,
+                                "a texture view does not fit its host copy; the slot stays null"
+                            );
+                        }
+                    }
                     return None;
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
@@ -4060,6 +4085,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
+        View::Sampler(..) | View::ConsoleSampler(..) => return null_sampler(at),
         _ => return null_view(at),
     };
     let desc = if buffer {

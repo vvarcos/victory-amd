@@ -14,6 +14,27 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// The optional app-local DirectX 12 Agility SDK (the export-table half is
+// in build.rs). Windows' d3d12.dll reads these two data exports and loads
+// `D3D12Core.dll` from the path relative to this executable. SDK 1.620.x is
+// version 620. See the `agility-sdk` feature and README deployment steps.
+#[cfg(all(windows, feature = "agility-sdk"))]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKVersion: u32 = 620;
+
+#[cfg(all(windows, feature = "agility-sdk"))]
+#[repr(transparent)]
+pub struct SdkPath(*const u8);
+#[cfg(all(windows, feature = "agility-sdk"))]
+// SAFETY: an immutable pointer to a NUL-terminated static string.
+unsafe impl Sync for SdkPath {}
+
+#[cfg(all(windows, feature = "agility-sdk"))]
+#[unsafe(no_mangle)]
+#[used]
+pub static D3D12SDKPath: SdkPath = SdkPath(b".\\D3D12\\\0".as_ptr());
+
 #[derive(Parser)]
 #[command(
     name = "victory",

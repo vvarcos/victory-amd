@@ -1309,7 +1309,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
-            return None;
+            // A texture whose host copy was refused once (the card had no
+            // room, or the driver would not have the format) used to stay
+            // refused for the whole run: a material texture read by a
+            // draw then sampled nothing forever, and the slot showed as
+            // null with the texture not even queued. A refusal for room is
+            // only true while the card is full: once the texture queue has
+            // let go of what nothing names any more, the asking is worth
+            // repeating. The other refusals (a format the host will not
+            // take) fail again at once, so retrying them costs one call.
+            if make && r.host.refused.load(Relaxed) && crate::resource::room() {
+                r.host.refused.store(false, Relaxed);
+            } else {
+                return None;
+            }
         }
         let clear = r
             .host

@@ -373,6 +373,15 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+On Windows 10, the in-box Direct3D 12 runtime can reject the shader-model-6.6
+root-signature flags this layer uses (`Unsupported bit-flag set`, flags
+`0xc00`). Build with `--features agility-sdk` and deploy the x64
+`D3D12Core.dll` from Microsoft DirectX 12 Agility SDK **1.620.x** as
+`target\release\D3D12\D3D12Core.dll`. The executable then exports
+`D3D12SDKVersion=620` and `D3D12SDKPath=".\\D3D12\\"`. Put
+`d3d12SDKLayers.dll` in the same directory for diagnostics with
+`VICTORY_D3D12_DEBUG=1`. Do not enable the feature without deploying the DLL.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -389,6 +398,10 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
+# Windows 10 when the in-box D3D12 runtime rejects root flags 0xc00:
+# cargo build --release -p victory --features agility-sdk
+# mkdir target\release\D3D12
+# copy <Agility SDK 1.620.x>\build\native\bin\x64\D3D12Core.dll target\release\D3D12\
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 

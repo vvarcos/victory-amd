@@ -2,7 +2,9 @@
 //! (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! and runs device callbacks on connect and disconnect. With the
+//! `diagnostics` feature, `VICTORY_INPUT_CMD` adds short, TTL-bounded
+//! commands from a file (`diagnostic`); physical input is only ORed.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -107,10 +109,16 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 
 /// Host input, or a fake in tests.
 trait Source: Send {
+    /// Called once per poll, before any reading is taken.
+    fn begin_poll(&mut self) {}
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Extra buttons for the keyboard's stand-in pad (diagnostics).
+    fn fallback_buttons(&mut self) -> u32 {
+        0
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -401,12 +409,21 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, fallback_buttons) = {
             let mut source = lock(&self.source);
+            source.begin_poll();
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let fallback_buttons = if pads.iter().any(Option::is_some) {
+                0
+            } else {
+                source.fallback_buttons()
+            };
+            (pads, keys, fallback_buttons)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self
+            .state()
+            .poll(&self.devices, pads, keys, fallback_buttons);
         self.deliver(events);
     }
 
@@ -451,6 +468,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        fallback_buttons: u32,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +476,11 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let mut pad = fallback(&keys);
+            pad.buttons |= fallback_buttons;
+            Value::Pad(pad)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -531,6 +553,10 @@ fn host() -> Box<dyn Source> {
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+
+#[cfg(feature = "diagnostics")]
+#[allow(dead_code)]
+mod diagnostic;
 
 type This = *const Object;
 type Out = *mut *const c_void;
@@ -1130,9 +1156,17 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        #[cfg(feature = "diagnostics")]
+        diagnostic: super::diagnostic::Channel,
     }
 
     impl Source for Host {
+        #[cfg(feature = "diagnostics")]
+        fn begin_poll(&mut self) {
+            self.diagnostic
+                .tick(super::diagnostic::utc_ms(), Instant::now());
+        }
+
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
@@ -1158,6 +1192,14 @@ mod host {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                let buttons = self.diagnostic.buttons();
+                if buttons != 0 {
+                    super::diagnostic::merge_pad(&mut pad, buttons);
+                    self.diagnostic.mark_delivered();
+                }
+            }
             Some(pad)
         }
 
@@ -1176,6 +1218,14 @@ mod host {
                     .collect();
                 down.extend(held);
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                let extra = self.diagnostic.keys().to_vec();
+                if !extra.is_empty() {
+                    super::diagnostic::merge_keys(&mut down, &extra);
+                    self.diagnostic.mark_delivered();
+                }
+            }
             down.into_iter()
                 .map(|vk| KeyState {
                     // SAFETY: plain query.
@@ -1186,6 +1236,15 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        #[cfg(feature = "diagnostics")]
+        fn fallback_buttons(&mut self) -> u32 {
+            let buttons = self.diagnostic.buttons();
+            if buttons != 0 {
+                self.diagnostic.mark_delivered();
+            }
+            buttons
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {

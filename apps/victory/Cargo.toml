@@ -21,6 +21,10 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+# Select an app-local DirectX 12 Agility SDK. The resulting executable must
+# have `D3D12\D3D12Core.dll` beside it (SDK version 620).
+agility-sdk = []
+
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

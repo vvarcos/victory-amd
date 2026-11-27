@@ -50,6 +50,39 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
 }
 
+/// Pipelines skipped by key or shader hash (`VICTORY_SKIP_PIPELINES` or known
+/// AMD driver crashers such as `0629334fc89d66f8cd24f4f5d4b88871`).
+fn skipped_pipeline(key: &str, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    const CRASHING_AMD_KEY: &str = "0629334fc89d66f8cd24f4f5d4b88871";
+    static ALLOW_CRASH: OnceLock<bool> = OnceLock::new();
+    static EXTRA_SKIPS: OnceLock<Vec<String>> = OnceLock::new();
+    let allow_crash = *ALLOW_CRASH
+        .get_or_init(|| std::env::var_os("VICTORY_ALLOW_CRASHING_PSO").is_some_and(|v| v == "1"));
+    if !allow_crash && key == CRASHING_AMD_KEY {
+        let names: Vec<String> = shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+        tracing::warn!(key, shaders = ?names, "skipping pipeline known to crash amdxc64.dll+0x861b9f");
+        return Some("crashes amdxc64.dll+0x861b9f, left out");
+    }
+    let extra = EXTRA_SKIPS.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    if !extra.is_empty()
+        && (extra.iter().any(|s| s == key)
+            || shaders.iter().any(|sh| extra.iter().any(|s| s == &sh.hash)))
+    {
+        let names: Vec<String> = shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+        tracing::warn!(key, shaders = ?names, "skipping pipeline via VICTORY_SKIP_PIPELINES");
+        return Some("skipped by VICTORY_SKIP_PIPELINES");
+    }
+    None
+}
+
 /// Whether some compute shader of `shaders` holds `name`.
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
@@ -102,7 +135,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let left_out = left_out(&shaders);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let left_out = left_out(&shaders).or_else(|| skipped_pipeline(&key, &shaders));
         Pending {
             shaders,
             graphics,
@@ -110,7 +144,7 @@ impl Pending {
             begun: OnceLock::new(),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -268,24 +302,168 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether the threads of a frame each wait for their own pipeline in its
+/// loading extension. The first waiter of a frame used to take the whole
+/// budget, extension and all, and any other thread that asked for a pipeline
+/// in that frame returned at once. At the start of a world the title binds
+/// hundreds of compute pipelines within a few seconds from several
+/// threads, so their dispatches (model unpacking, run once) were dropped
+/// although their pipelines were made 2-30 ms later, and characters' heads
+/// and a room's walls were missing for the session. Now only the base
+/// budget is shared that way; past it the frame has a loading window in
+/// which every thread waits for the pipeline it needs. On by default;
+/// `VICTORY_PIPELINE_WAIT_OWN=0` restores the old sharing (it needs the
+/// shared budget).
+fn own_extension() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Waits that returned without the pipeline because another thread had
+/// taken the frame's budget and no loading window was left to wait in
+/// (graphics, compute); their draws are dropped.
+static REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// When the first of them was, and how many milliseconds after it they were
+/// last logged.
+static REFUSED_FIRST: OnceLock<Instant> = OnceLock::new();
+static REFUSED_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+fn refused(compute: bool) {
+    REFUSED_FIRST.get_or_init(Instant::now);
+    REFUSED[usize::from(compute)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Logs the waits refused since the last such line, a second after it at
+/// the earliest. Called when a pipeline is waited for, so the waits of a
+/// burst are in one line and the last of them are not left unreported.
+fn log_refused() {
+    let Some(first) = REFUSED_FIRST.get() else {
+        return;
+    };
+    let now = first.elapsed().as_millis() as u64;
+    let last = REFUSED_LOGGED.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000
+        || (REFUSED[0].load(Ordering::Relaxed) == 0 && REFUSED[1].load(Ordering::Relaxed) == 0)
+    {
+        return;
+    }
+    if REFUSED_LOGGED
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        tracing::warn!(
+            "pipeline waits refused since the last such line: compute {}, graphics {} (their draws are dropped)",
+            REFUSED[1].swap(0, Ordering::Relaxed),
+            REFUSED[0].swap(0, Ordering::Relaxed),
+        );
+    }
+}
+
+/// Blocks until `p` is made, is a slow one, or `until` passes.
+fn block_until(p: &Pending, until: Instant) {
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() && !slow(p) {
+        let rest = until.saturating_duration_since(Instant::now());
+        if rest.is_zero() {
+            break;
+        }
+        // Woken now and then to see whether it has become a slow one.
+        let rest = rest.min(Duration::from_millis(250));
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// A frame's loading window: the time its threads may wait for pipelines
+/// past the base budget. Time counts while at least one thread waits in
+/// it, once however many do, and not between waits.
+struct Window {
+    frame: u64,
+    length: Duration,
+    /// What the waits that have ended took of it.
+    used: Duration,
+    /// The threads waiting in it, and since when one has been.
+    waiting: u32,
+    since: Instant,
+}
+
+impl Window {
+    /// A thread of `frame` begins to wait at `now`: until when it may. A
+    /// first wait of a frame opens its window, `length` long. `None` for a
+    /// thread still recording an earlier frame, which does not take the
+    /// window from the frame that has it.
+    fn enter(slot: &mut Option<Window>, frame: u64, now: Instant, length: Duration) -> Option<Instant> {
+        match slot {
+            Some(window) if window.frame == frame => {}
+            Some(window) if window.frame > frame => return None,
+            _ => {
+                *slot = Some(Window {
+                    frame,
+                    length,
+                    used: Duration::ZERO,
+                    waiting: 0,
+                    since: now,
+                });
+            }
+        }
+        let window = slot.as_mut()?;
+        if window.waiting == 0 {
+            window.since = now;
+        }
+        window.waiting += 1;
+        Some(window.since + window.length.saturating_sub(window.used))
+    }
+
+    /// The wait [`Window::enter`] allowed a thread of `frame` ends at
+    /// `now`: what it adds to the gate, which is the time since a thread
+    /// began to wait if this was the last one waiting. A frame that began
+    /// meanwhile has its own window.
+    fn leave(slot: &mut Option<Window>, frame: u64, now: Instant) -> Duration {
+        let Some(window) = slot.as_mut().filter(|window| window.frame == frame) else {
+            return Duration::ZERO;
+        };
+        window.waiting = window.waiting.saturating_sub(1);
+        if window.waiting > 0 {
+            return Duration::ZERO;
+        }
+        let waited = now
+            .saturating_duration_since(window.since)
+            .min(window.length.saturating_sub(window.used));
+        window.used += waited;
+        waited
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
-    if budget.is_zero() || slow(p) {
+    log_refused();
+    let base = wait_budget();
+    if base.is_zero() || slow(p) || p.made.get().is_some() {
         return;
     }
     // What was waited past the budget since the start, in milliseconds; the
-    // second of each is the compute pipelines'.
+    // second of each is the compute pipelines' (the gate).
     static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    let cap = if compute {
+        LOADING_FRAME_COMPUTE
+    } else {
+        LOADING_FRAME
+    };
+    let shared = shared_budget();
+    // With a loading window the threads share only the base budget.
+    let own = shared && own_extension();
+    let budget = if own {
+        base
+    } else {
+        base.max(cap.min(loading))
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let frame_spent = &SPENTS[usize::from(compute)];
-    let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
@@ -297,26 +475,16 @@ fn wait(p: &Pending, frame: u64) {
         }
         left
     };
-    if left.is_zero() {
-        return;
-    }
-    let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !slow(p) {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
+    let entered = Instant::now();
+    if !left.is_zero() {
+        block_until(p, entered + left);
+        let waited = entered.elapsed().min(left);
+        if !own {
+            past_total.fetch_add(
+                waited.saturating_sub(base).as_millis() as u64,
+                Ordering::Relaxed,
+            );
         }
-        // Woken now and then to see whether it has become a slow one.
-        let rest = rest.min(Duration::from_millis(250));
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
-    let waited = started.elapsed().min(left);
-    let past = waited.saturating_sub(wait_budget());
-    past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
-    {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
@@ -327,11 +495,38 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
-    crate::framelog::add(crate::framelog::T::PipelineWaitUs, started.elapsed().as_micros() as u64);
+    let mut own_waited = false;
+    if own && p.made.get().is_none() && !slow(p) {
+        // The first thread whose pipeline is not there after the base
+        // budget opens the frame's loading window, for what the loading
+        // cap and the gate allow past the base budget, and every thread of
+        // the frame waits for its own pipeline inside it. The frame stands
+        // waiting no longer than its first waiter alone held it before,
+        // however many pipelines its threads wait for (the title's GPU
+        // watchdog bounds a frame), and that time goes to the gate.
+        static WINDOWS: [Mutex<Option<Window>>; 2] = [const { Mutex::new(None) }; 2];
+        let window = &WINDOWS[usize::from(compute)];
+        let length = cap.min(loading).saturating_sub(base);
+        let until = {
+            let mut window = window.lock().unwrap_or_else(|e| e.into_inner());
+            Window::enter(&mut window, frame, Instant::now(), length)
+        };
+        if let Some(until) = until {
+            own_waited = until > Instant::now();
+            block_until(p, until);
+            let mut window = window.lock().unwrap_or_else(|e| e.into_inner());
+            let past = Window::leave(&mut window, frame, Instant::now());
+            past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+    if shared && left.is_zero() && !own_waited && p.made.get().is_none() && !slow(p) {
+        refused(compute);
+    }
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, entered.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
+        entered.elapsed().as_micros() as u64,
     );
 }
 
@@ -517,5 +712,70 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// The accounting of a frame's loading window on given instants.
+    #[test]
+    fn a_loading_window_counts_the_time_some_thread_waits() {
+        let (secs, ms) = (Duration::from_secs, Duration::from_millis);
+        let t0 = Instant::now();
+        let mut slot = None;
+        // Two threads wait at the same time: both until the window ends,
+        // and the time is charged once, when the last of them returns.
+        assert_eq!(Window::enter(&mut slot, 7, t0, secs(4)), Some(t0 + secs(4)));
+        assert_eq!(Window::enter(&mut slot, 7, t0 + ms(10), secs(4)), Some(t0 + secs(4)));
+        assert_eq!(Window::leave(&mut slot, 7, t0 + ms(30)), Duration::ZERO);
+        assert_eq!(Window::leave(&mut slot, 7, t0 + ms(50)), ms(50));
+        // A later wait of the frame has what is left, from when it begins:
+        // the time nobody waited is not counted.
+        assert_eq!(Window::enter(&mut slot, 7, t0 + secs(2), secs(9)), Some(t0 + secs(2) + ms(3950)));
+        assert_eq!(Window::leave(&mut slot, 7, t0 + secs(3)), secs(1));
+        // A thread still recording the frame before neither waits nor
+        // takes the window, and its return charges nothing.
+        assert_eq!(Window::enter(&mut slot, 6, t0 + secs(3), secs(4)), None);
+        assert_eq!(Window::leave(&mut slot, 6, t0 + secs(3)), Duration::ZERO);
+        // A wait that runs to the end of the window charges what was left
+        // of it, and a wait after that returns at once.
+        assert_eq!(Window::enter(&mut slot, 7, t0 + secs(5), secs(4)), Some(t0 + secs(5) + ms(2950)));
+        assert_eq!(Window::leave(&mut slot, 7, t0 + secs(9)), ms(2950));
+        assert_eq!(Window::enter(&mut slot, 7, t0 + secs(10), secs(4)), Some(t0 + secs(10)));
+        assert_eq!(Window::leave(&mut slot, 7, t0 + secs(10)), Duration::ZERO);
+        // The next frame opens its own window; a wait of the frame before
+        // that ends afterwards does not charge it.
+        assert_eq!(Window::enter(&mut slot, 7, t0 + secs(11), secs(4)), Some(t0 + secs(11)));
+        assert_eq!(Window::enter(&mut slot, 8, t0 + secs(12), secs(2)), Some(t0 + secs(14)));
+        assert_eq!(Window::leave(&mut slot, 7, t0 + secs(13)), Duration::ZERO);
+        assert_eq!(Window::leave(&mut slot, 8, t0 + secs(13)), secs(1));
+    }
+
+    /// A thread that asks for a pipeline while another thread of the frame
+    /// waits for its own gets it too, instead of returning at once.
+    #[test]
+    fn a_second_thread_of_the_frame_waits_for_its_pipeline() {
+        if !own_extension() || !shared_budget() || wait_budget() < Duration::from_millis(400) {
+            return;
+        }
+        // A frame no other test names, so none of them has its budget.
+        let frame = 1 << 40;
+        let pending = || {
+            let p = Pending::new(Vec::new(), None);
+            // A worker has it and is not done.
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let (first, second) = (pending(), pending());
+        std::thread::scope(|scope| {
+            // The first thread takes the frame's base budget.
+            scope.spawn(|| wait(&first, frame));
+            std::thread::sleep(Duration::from_millis(50));
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                second.make();
+                std::thread::sleep(Duration::from_millis(50));
+                first.make();
+            });
+            wait(&second, frame);
+            assert!(second.made.get().is_some());
+        });
     }
 }

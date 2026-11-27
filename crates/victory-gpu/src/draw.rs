@@ -2621,10 +2621,16 @@ impl State {
         const DRAW_CONSTANTS: u32 = 56;
         let wanted = list_slots();
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::draw::slots_miss("no host pipeline");
             return String::new();
         };
         let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
         else {
+            crate::draw::slots_miss(&format!(
+                "no stage matches {:?}; stages {:?}",
+                wanted,
+                p.stages.iter().map(|s| s.shader.hash.as_str()).collect::<Vec<_>>()
+            ));
             return String::new();
         };
         let Some(heap) = self
@@ -2634,6 +2640,7 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())
         else {
+            crate::draw::slots_miss("no non-sampler heap");
             return String::new();
         };
         let t = stage.translated();
@@ -2899,8 +2906,16 @@ impl State {
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
+            // Only when this draw really made the host slot: a view the
+            // host would not make (a texture refused for room, or one
+            // whose host copy is not there yet) leaves the slot null, and
+            // taking it out of the queue here kept it null for the rest of
+            // the run — the black material surfaces, with the texture not
+            // even queued. Left in the queue, the pass makes it as soon as
+            // the card has room.
             if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+                let made = host.texture_slot_made_from(index, handle);
+                host.texture_slot_tabled(index, made);
             } else {
                 host.buffer_slot_tabled(index);
             }
@@ -3867,6 +3882,25 @@ fn list_slots() -> &'static [String] {
             .filter(|s| !s.is_empty())
             .collect()
     })
+}
+
+/// Says, once per reason, why a draw asked to list its slots did not:
+/// `VICTORY_LIST_SLOTS` names a shader, and this is how the run finds out
+/// that no draw reached [`State::slots_text`]'s body.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slots_miss(why: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut seen = match SEEN.lock() {
+        Ok(seen) => seen,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seen = seen.get_or_insert_with(HashSet::new);
+    let key = why.chars().take(80).collect::<String>();
+    if seen.insert(key) {
+        tracing::info!(why, "a draw asked for its slots and could not list them");
+    }
 }
 
 /// A fingerprint of the 4 KiB of title memory at `at` (FNV-1a, 64 bits; of

@@ -84,19 +84,22 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
-pub extern "system" fn XMemVirtualAlloc(
+fn virtual_alloc(
     base: *mut c_void,
     size: usize,
     kind: u32,
     flags: u64,
     protect: u32,
+    align: usize,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
         Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
+            align.max(2 * MIB)
+        } else if align > PAGE {
+            align
         } else {
             0
         },
@@ -158,11 +161,22 @@ pub extern "system" fn XMemVirtualAlloc(
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            align,
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
     }
     at
+}
+
+pub extern "system" fn XMemVirtualAlloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+) -> *mut c_void {
+    virtual_alloc(base, size, kind, flags, protect, 0)
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -278,12 +292,14 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f);
+        return virtual_alloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            align,
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -1105,6 +1121,17 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+        for field in [17u64, 18, 20, 21] {
+            let align = 1usize << field;
+            let attributes = ALLOC_32BIT | (field << ALIGNMENT_SHIFT);
+            let p = XMemAlloc(4096, attributes);
+            assert!(!p.is_null(), "field {field}");
+            assert!((p as usize) < 1 << 32, "field {field}");
+            assert_eq!(p as usize % align, 0, "field {field}");
+            // SAFETY: 4096 bytes were allocated with PAGE_READWRITE.
+            unsafe { p.cast::<u8>().write_bytes(0xcd, 4096) };
+            XMemFree(p, attributes);
+        }
     }
 
     #[test]
