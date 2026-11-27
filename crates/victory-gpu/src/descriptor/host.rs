@@ -2166,6 +2166,12 @@ impl HostHeap {
         size: u32,
         at: D3D12_CPU_DESCRIPTOR_HANDLE,
     ) -> Option<Kept> {
+        // The lever for the A/B of the staging itself: `VICTORY_CONSTANT_STAGE=0`
+        // refuses an unaligned constant view as before (the shader then reads
+        // zeroed material), with the same build and nothing else changed.
+        if std::env::var_os("VICTORY_CONSTANT_STAGE").is_some_and(|v| v == "0") {
+            return None;
+        }
         let Some(host) = host() else { return None };
         let Some(list) = crate::list::current_list() else {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -3847,6 +3853,14 @@ fn buffer_uav(
 fn casts_fully_typed() -> bool {
     static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ONCE.get_or_init(|| {
+        // A lever for the A/B of the sRGB work: `VICTORY_SRGB_TYPED=0` keeps
+        // the old behaviour (a typed texture's view took the texture's own
+        // format, losing the colour space), the same run and build
+        // otherwise, so the two arms differ in that and nothing else.
+        if std::env::var_os("VICTORY_SRGB_TYPED").is_some_and(|v| v == "0") {
+            tracing::info!("sRGB views of typed textures off (VICTORY_SRGB_TYPED=0)");
+            return false;
+        }
         let Some(host) = host() else { return false };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
         // SAFETY: a plain query into our own structure.
