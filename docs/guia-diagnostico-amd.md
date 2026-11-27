@@ -365,6 +365,34 @@ Ou seja, **87% das constantes foram recusadas** e o shader leu material zerado �
 
 **ScarlettPort ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)):** é um projeto separado que embarca um runtime derivado do mesmo emulador, não um fork que se possa mesclar diretamente. Dele foram aproveitadas as correções de sRGB e de formatos acima. Outros commits de lá (ray tracing, replay de render targets, `memory.rs`) são grandes demais para portar às cegas e ficam registrados como referência.
 
+## 26. Constantes de material: 16 bytes no console, 256 no PC
+
+O jogo alinha os constant buffers a 16 bytes (regra do console); o D3D12 do PC exige 256. Medido com contador dedicado:
+
+```
+constant views made=104051 unaligned=682894   (antes)
+constant views made=91531 staged=541696       (depois)
+```
+
+Antes, 87% das constantes eram recusadas e o shader lia material zerado — superfície escura com geometria e luz corretas. Agora os bytes são copiados para uma **arena de upload persistente por heap** ([descriptor/host.rs](<../crates/victory-gpu/src/descriptor/host.rs>), `Staged`/`refill_staged`), preenchida em cada passe por `list.defer_fill` e reabastecida em [draw.rs](<../crates/victory-gpu/src/draw.rs>) (`heap_pass_ends`).
+
+Por que uma arena do heap e não o scratch da lista: o descritor de um slot de heap sobrevive à lista, e o scratch é reciclado a cada `reset` — o slot passaria a apontar para memória reutilizada (material corrompido, pior que zerado).
+
+Tentativa anterior que não funcionou: deslocar a base da cópia host para ficar congruente com o endereço do título (módulo 256). A proporção de recusas não mudou, porque a origem do título não é múltiplo de 256. Revertida.
+
+## 27. sRGB: o que está coberto e o que falta
+
+- **Coberto:** view sRGB de textura tipada mantém o espaço de cor quando o host aceita cast totalmente tipado (`CastingFullyTypedFormatSupported`), com os sete pares de formato (28/29, 87/91, 88/93, BC1/BC2/BC3/BC7). Cópias typeless sRGB sem descrição ganham a descrição implícita; UAV nunca nomeia sRGB (usa o irmão linear); `typed_store` evita device-removal em UAV de formato que o host não armazena; formato 191 = 2 bytes.
+- **Sem perda (auditado, não mexer):** render targets e blend ficam no formato do título; `CopyResource`/`CopyTextureRegion`/`ResolveSubresource` são bit a bit; a captura lê os bits e grava PNG (assumido sRGB).
+- **Falta:** em host que não reporta cast totalmente tipado, views sRGB caem para linear (contador `SRGB_VIEWS[1]`). Corrigir exigiria tornar tipeless todas as texturas sRGB — risco alto, não feito. UAV sRGB não existe no host; a view lê/escreve o irmão linear (contador `SRGB_VIEWS[2]`).
+- **Flag:** `VICTORY_SRGB_PRESENT=1` cria a swap chain no irmão sRGB. É comprovadamente bit a bit (só copiamos), então não muda a imagem SDR; serve para confirmar a hipótese com validação.
+
+## 28. Performance: onde os 400 ms realmente estão
+
+Três mudanças seguras foram aplicadas e medidas em micro-bench: hash do cache de tabelas (5,8 → 2,8 ns por registro), seleção da fila de texturas sem ordenar todo o backlog (0,62 → 0,01 ms por passe com 30 000 vencidos) e constantes de root na pilha (sem `Vec` por estágio por draw). Ganho total estimado: **1–5 ms por frame, 0,2–1%**.
+
+O custo dominante está em outro lugar, por evidência do código: o passe de texturas por índice com orçamento `VICTORY_TEXTURE_STAGE_MS=250` (até 750 ms com catch-up), o **copy-back** de 70–108 MB por frame, e a espera pela GPU. Para medir no próximo run: a linha de FPS (`preparing: copies … textures …; … on the GPU; … copying back`), a linha `textures picked by index, the pass per frame by phase`, e `VICTORY_PROFILE=1` com `VICTORY_PROFILE_OUT`.
+
 ## Checklist antes de publicar um resultado
 
 - [ ] Build, revisão, features, driver, hashes e ambiente registrados.
