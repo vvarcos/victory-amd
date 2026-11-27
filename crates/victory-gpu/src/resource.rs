@@ -612,8 +612,20 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear twins: the pairs the host casts, RGBA8,
+/// BGRA8, BGRX8, and the BC1, BC2, BC3 and BC7 block formats. The view
+/// checks keep a view's sRGB format only on hosts that cast fully typed
+/// formats (`descriptor::host::casts_fully_typed`); elsewhere, and for
+/// unordered access, the view takes the linear format.
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (91, 87),
+    (93, 88),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (99, 98),
+];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if

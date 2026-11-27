@@ -3559,18 +3559,48 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
-/// Whether the host can make a shader (or unordered access) view of
-/// `texture` in `format` (none: the texture's own). The console allows any
-/// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+/// Whether the host may view a fully typed texture in another format of its
+/// family (`D3D12_FEATURE_DATA_D3D12_OPTIONS3`). Only there can an sRGB view
+/// of the typed linear texture keep its colour space; a host without the
+/// capability removes the device for a typed view in another format, so the
+/// view takes the texture's format as before ([`fits`]). Asked once.
+fn casts_fully_typed() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // SAFETY: a plain query into our own structure.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        let casts = queried.is_ok() && options.CastingFullyTypedFormatSupported.as_bool();
+        tracing::info!(casts, "host casts fully typed formats");
+        casts
+    })
+}
+
+/// Checks the texture's flags and chooses a compatible format for its shader
+/// (or unordered access) view: `d` is the texture's description, `format` the
+/// view's (none: the texture's own), and `casts_fully_typed` whether the host
+/// may view a fully typed texture in another format of its family. The
+/// console allows any view; the host refuses (and removes the device for)
+/// views without the resource's permission, of typed depth, and in another
+/// format than a typed resource's. A view of a typed texture in another
+/// format of its family takes the texture's format, except an sRGB/linear
+/// pair ([`srgb_pair`]) on a host that casts fully typed formats: the view
+/// keeps its colour space. Unordered views always take the texture's linear
+/// format (the host has no sRGB unordered access).
+fn fits(
+    d: D3D12_RESOURCE_DESC,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+    casts_fully_typed: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     } else {
@@ -3617,10 +3647,20 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     if let Some(format) = format
         && !typeless
+        && view != own
+        && (unordered || !casts_fully_typed || !srgb_pair(own, view))
     {
         *format = d.Format;
     }
     true
+}
+
+/// Whether `own` and `view` are the sRGB and linear formats of one texture
+/// family: the pairs [`crate::resource::SRGB`] names, the host's own
+/// (RGBA8, BGRA8, BGRX8, BC1, BC2, BC3 and BC7).
+fn srgb_pair(own: u32, view: u32) -> bool {
+    let pair = (own.max(view), own.min(view));
+    crate::resource::SRGB.contains(&pair)
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -3697,6 +3737,54 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // Material constants are what make a surface show its base
+            // colour, roughness and transforms: a null constant view is a
+            // black material. Counted by reason, so the run says whether
+            // that is what the dark surfaces see.
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                static OK: AtomicU64 = AtomicU64::new(0);
+                static UNALIGNED: AtomicU64 = AtomicU64::new(0);
+                static NO_SHADOW: AtomicU64 = AtomicU64::new(0);
+                static COUNTED: AtomicU64 = AtomicU64::new(0);
+                let report = |ok: u64, unaligned: u64, none: u64| {
+                    tracing::info!(
+                        made = ok,
+                        unaligned,
+                        no_host_copy = none,
+                        "constant views made for draws"
+                    );
+                };
+                let shadow = crate::shadow::find(address, u64::from(size));
+                if shadow.is_none() {
+                    let n = NO_SHADOW.fetch_add(1, Relaxed) + 1;
+                    if COUNTED.fetch_add(1, Relaxed).is_multiple_of(512) {
+                        report(
+                            OK.load(Relaxed),
+                            UNALIGNED.load(Relaxed),
+                            n,
+                        );
+                    }
+                    return None;
+                }
+                let gpu = shadow.as_ref().map_or(0, |s| s.gpu(address));
+                if gpu % 256 != 0 {
+                    let n = UNALIGNED.fetch_add(1, Relaxed) + 1;
+                    if COUNTED.fetch_add(1, Relaxed).is_multiple_of(512) {
+                        report(OK.load(Relaxed), n, NO_SHADOW.load(Relaxed));
+                    }
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                }
+                OK.fetch_add(1, Relaxed);
+                if COUNTED.fetch_add(1, Relaxed).is_multiple_of(4096) {
+                    report(OK.load(Relaxed), UNALIGNED.load(Relaxed), NO_SHADOW.load(Relaxed));
+                }
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -3742,7 +3830,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                // SAFETY: the texture is live for this view creation.
+                let resource_desc = unsafe { texture.GetDesc() };
+                if !fits(
+                    resource_desc,
+                    desc.as_mut().map(|d| &mut d.Format),
+                    false,
+                    casts_fully_typed(),
+                ) {
                     // Why a slot a draw reads stays null although the
                     // texture's host copy exists: the view does not fit it.
                     // Counted by the reason the two descriptions give.
@@ -3850,7 +3945,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 None => texture,
             };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            // SAFETY: the texture (or its depth twin) is live.
+            let resource_desc = unsafe { texture.GetDesc() };
+            if !fits(
+                resource_desc,
+                desc.as_mut().map(|d| &mut d.Format),
+                true,
+                casts_fully_typed(),
+            ) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -4981,6 +5083,40 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// An sRGB view of a typed linear texture keeps its colour space on a
+    /// host that casts fully typed formats; without that capability, and for
+    /// unordered views, it takes the texture's format. Another family stays
+    /// refused.
+    #[test]
+    fn typed_texture_views_keep_the_requested_colour_space() {
+        let format = |own, requested, unordered, casts| {
+            let resource = D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT(own),
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut view = DXGI_FORMAT(requested);
+            fits(resource, Some(&mut view), unordered, casts).then_some(view.0)
+        };
+        for (linear, srgb) in [
+            (28, 29), // R8G8B8A8
+            (87, 91), // B8G8R8A8
+            (88, 93), // B8G8R8X8
+            (71, 72), // BC1
+            (74, 75), // BC2
+            (77, 78), // BC3
+            (98, 99), // BC7
+        ] {
+            assert_eq!(format(linear, srgb, false, true), Some(srgb), "{linear}/{srgb}");
+            assert_eq!(format(srgb, linear, false, true), Some(linear), "{srgb}/{linear}");
+            assert_eq!(format(linear, srgb, false, false), Some(linear), "{linear}/{srgb}");
+        }
+        assert_eq!(format(28, 29, true, true), Some(28)); // UAVs stay linear
+        assert_eq!(format(27, 29, false, false), Some(29)); // typeless RGBA8
+        assert_eq!(format(28, 31, false, true), Some(28)); // same family, SNORM
+        assert_eq!(format(28, 91, false, true), None); // BGRA view of RGBA
     }
 }
 

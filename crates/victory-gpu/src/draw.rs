@@ -3100,10 +3100,18 @@ impl State {
                         // for a shader that picks it by index all the same.
                         if let Some(title) = title_first {
                             if crate::descriptor::host::is_texture_view(&view) {
-                                host.texture_slot_tabled(title + k, kind.is_some());
+                                // The title's slot goes out of the queue only
+                                // when this draw really made its host slot,
+                                // as in `table_entry`: a view the host would
+                                // not make leaves it null, and taking it out
+                                // here kept it null for the rest of the run.
+                                let handle = table + u64::from(k) * 32;
                                 if kind.is_some() {
-                                    host.mirror(title + k, table + u64::from(k) * 32, true);
+                                    host.mirror(title + k, handle, true);
                                 }
+                                let read = kind.is_some()
+                                    && host.texture_slot_made_from(title + k, handle);
+                                host.texture_slot_tabled(title + k, read);
                             } else {
                                 host.buffer_slot_tabled(title + k);
                             }
