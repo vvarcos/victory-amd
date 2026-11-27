@@ -306,6 +306,45 @@ Fonte: [pull requests de myokex/victory-amd](https://github.com/myokex/victory-a
 
 **Evidência r41 do PR #6:** os inventários iniciais de cache e dados dos braços A/B eram idênticos, o SHA-256 do executável foi `0B3BC1DE…B225E`, e só `VICTORY_PIPELINE_WAIT_OWN` variou. O braço A caiu antes do mundo e o B produziu 68 capturas internas e 3 externas. O B alterou `host-pipelines.bin` de forma própria (final: 302.800 bytes, SHA-256 `CC04962B…15EDC9`); isso não pode ser comparado ao A como efeito da variável, pois A percorreu menos conteúdo. Houve uma recusa de mesh PSO com `E_INVALIDARG`, e os milhares de drops no mundo foram atribuídos pelo log aos caminhos de ray tracing deliberadamente desabilitados/left-out, não a pipelines ainda sendo compiladas. O relatório reproduzível está em `G:\victory-data\experiments\r41-pr6\analysis.json`.
 
+## 24. Resolução: por que o jogo aparece em 4K e o que o perfil Series S muda
+
+**Sintoma:** com overlay de desempenho, o jogo aparece em 4K mesmo com `VICTORY_DISPLAY_MODE=1920x1080`.
+
+**Medido:** a variável só muda o **modo que o console informa ao título** ([dxgi.rs:227](<../crates/victory-gpu/src/dxgi.rs#L227>)). Com o perfil padrão (Series X) o título ignora o modo informado e cria swap chain 3840×2160:
+
+```
+display mode reported to the title width=1920 height=1080
+presenting to a window width=3840 height=2160 format=28
+```
+
+Com `--console series-s` a swap chain passa a ser exatamente 1920×1080:
+
+```
+presenting to a window width=1920 height=1080 format=28
+```
+
+O perfil muda também o tipo de dispositivo (0x60 em vez de 0x64), a memória de título (7.776 MiB em vez de 10 GiB) e os pipes de textura (`Pipes::SERIES_S`). O perfil **não** deve ser escolhido apenas pela resolução: ele muda o caminho gráfico do próprio jogo.
+
+**Consequência encontrada no Series S (ainda não resolvida):** com 1080p o título ativa **FSR4** e registra 29 falhas:
+
+```
+FFX FSR4 ACO: DeserializeComputePipelineStateX FAILED hr=0x80004001 for 'FFX_FSR4_PASS_0..26/SPD/RCAS' - falling back to NewBE
+```
+
+Essas falhas coincidem com 29 avisos `a pipeline creation method that is not implemented` ([device.rs:359](<../crates/victory-gpu/src/device.rs#L359>)): dois métodos de `ID3D12Device` (o de criação por stream/serialized state, entre eles) ainda não existem. O título cai no caminho "NewBE" e, após o cartão de capítulo, produz tela escura/vazia — enquanto o Series X, que não usa FSR4, renderiza Lucía, o telefone e o pátio da prisão em cores.
+
+**Comparação medida (mesmo binário `0B3BC1DE…`):**
+
+| aspecto | Series X | Series S |
+|---|---|---|
+| swap chain | 3840×2160 | **1920×1080** |
+| capturas internas | 1920×1080 | 960×540 (50%) |
+| FSR4 | ausente | 29 falhas, fallback NewBE |
+| conteúdo após o cartão "NOVE MESES ATRÁS" | Lucía, telefone, pátio | campo escuro/vazio |
+| crash | AV intermitente | AV em 2 de 3 tentativas |
+
+**Caminho adiante:** implementar a criação de pipeline por stream desc (compute) para o FSR4, ou impedir o título de escolher FSR4 para que ele renderize 1080p nativo. Nenhuma das duas está implementada; forçar Series S hoje troca 4K por tela escura.
+
 ## Checklist antes de publicar um resultado
 
 - [ ] Build, revisão, features, driver, hashes e ambiente registrados.
