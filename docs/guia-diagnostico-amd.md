@@ -393,6 +393,27 @@ Três mudanças seguras foram aplicadas e medidas em micro-bench: hash do cache 
 
 O custo dominante está em outro lugar, por evidência do código: o passe de texturas por índice com orçamento `VICTORY_TEXTURE_STAGE_MS=250` (até 750 ms com catch-up), o **copy-back** de 70–108 MB por frame, e a espera pela GPU. Para medir no próximo run: a linha de FPS (`preparing: copies … textures …; … on the GPU; … copying back`), a linha `textures picked by index, the pass per frame by phase`, e `VICTORY_PROFILE=1` com `VICTORY_PROFILE_OUT`.
 
+## 29. A/B dos dois consertos: nenhum dos dois muda as cenas medidas
+
+Dois controles com o **mesmo binário e mesmo protocolo**, variando só a flag:
+
+| cena pareada | `VICTORY_SRGB_TYPED=0` | `=1` (padrão) |
+|---|---:|---:|
+| interior escuro A | média R 29,5 · médios 22,5% | 20,1 · 3,4% |
+| interior escuro B | 12,3 · 4,6% | 8,8 · 2,9% |
+| pátio (cena idêntica, distância 4/256) | 107,3 · 78,9% | 109,0 · 79,0% |
+
+E para o staging de constantes (`VICTORY_CONSTANT_STAGE=0` desliga a arena):
+
+| cena pareada | staging desligado | staging ligado |
+|---|---:|---:|
+| interior A (distância 35/256) | média R 18,9 · médios 5,7% | 20,1 · 3,4% |
+| interior B (distância 4/256) | 7,3 · 2,1% | 8,8 · 2,9% |
+
+**Conclusão honesta:** nem a preservação de sRGB nem o staging de constantes mudam visivelmente as cenas testadas. As duas hipóteses (albedo sem decodificação gama; material zerado por constante nula) **não explicam** as superfícies escuras nesses casos. O ganho aparente em capturas anteriores era variação de cena, não do código.
+
+Onde os descritores de material realmente diferem (dos dumps `*-ops.txt`): a superfície escura usa **root descriptor** (`Srv s3+0: Descriptor` + `root3=`), 17 SRVs de tabela e 6 MRT; o material que funciona (decal/letreiro) usa só tabelas explícitas e root constants, 7 SRVs. É nesse caminho de root descriptor — e nos slots de textura que aparecem nulos — que a investigação deve continuar.
+
 ## Checklist antes de publicar um resultado
 
 - [ ] Build, revisão, features, driver, hashes e ambiente registrados.
