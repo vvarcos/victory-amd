@@ -345,6 +345,26 @@ Essas falhas coincidem com 29 avisos `a pipeline creation method that is not imp
 
 **Caminho adiante:** implementar a criação de pipeline por stream desc (compute) para o FSR4, ou impedir o título de escolher FSR4 para que ele renderize 1080p nativo. Nenhuma das duas está implementada; forçar Series S hoje troca 4K por tela escura.
 
+## 25. Achados de 27/11: constantes alinhadas a 16 bytes, sRGB e o ScarlettPort
+
+**Causa medida para materiais escuros (parcial):** constantes de material chegam ao host em endereços alinhados a 16 bytes, mas o D3D12 do PC exige 256 bytes para uma CBV. O caminho "fresco" (tabelas dinâmicas) resolve isso copiando para scratch alinhado; o caminho de espelho não, e recusa a view. Medição com contador dedicado:
+
+```
+constant views made for draws made=104051 unaligned=682894 no_host_copy=0
+```
+
+Ou seja, **87% das constantes foram recusadas** e o shader leu material zerado — o que explica superfícies escuras com geometria e luzes corretas.
+
+**Tentativa que não funcionou:** deslocar a base da cópia host para ficar congruente com o endereço do título (módulo 256). Resultado medido: `made=24661 unaligned=167340` — a proporção não mudou, porque o endereço de origem do título não é múltiplo de 256 (o console exige só 16). Revertido. A correção certa é a mesma do caminho fresco: copiar os bytes para um scratch alinhado da lista (`list.scratch` + `constant_at`) antes de criar a CBV, o que exige passar a lista até o caminho de espelho.
+
+**Correção aplicada (sRGB):** views sRGB de texturas tipadas deixaram de ser convertidas para o formato linear do recurso. Antes, `fits()` sobrescrevia o formato da view ([descriptor/host.rs](<../crates/victory-gpu/src/descriptor/host.rs>)), então albedo era amostrado sem decodificação gama. Agora o formato é preservado quando o host aceita cast de formatos totalmente tipados (`D3D12_OPTIONS3.CastingFullyTypedFormatSupported`, registrado no log como `host casts fully typed formats casts=true`), com os pares 28/29, 87/91, 88/93 e BC1/BC2/BC3/BC7 (71/72, 74/75, 77/78, 98/99).
+
+**Formatos de console:** 189 e 191 passam a 4 e 2 bytes; 190 a 1 byte ([texture.rs](<../crates/victory-formats/src/texture.rs>)).
+
+**Efeito visual observado (r46, mesmo protocolo):** o pátio da prisão e a cena interna passaram a mostrar cor e detalhe na roupa, cabelo e nas pessoas, em vez de silhuetas; em contraluz forte a imagem satura (a exposição ainda não é nossa conhecida). Não é prova de correção completa: faltam capturas pareadas antes/depois da mesma cena e o ajuste fino de constantes.
+
+**ScarlettPort ([ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)):** é um projeto separado que embarca um runtime derivado do mesmo emulador, não um fork que se possa mesclar diretamente. Dele foram aproveitadas as correções de sRGB e de formatos acima. Outros commits de lá (ray tracing, replay de render targets, `memory.rs`) são grandes demais para portar às cegas e ficam registrados como referência.
+
 ## Checklist antes de publicar um resultado
 
 - [ ] Build, revisão, features, driver, hashes e ambiente registrados.
